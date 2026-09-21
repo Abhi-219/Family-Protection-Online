@@ -3,6 +3,7 @@ package com.example.family
 import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -79,14 +80,26 @@ import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 class MainActivity : ComponentActivity() {
+    private var isForeground by mutableStateOf(true)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
             FamilyTheme {
-                DnsControlScreen()
+                DnsControlScreen(isForeground)
             }
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        isForeground = true
+    }
+
+    override fun onStop() {
+        super.onStop()
+        isForeground = false
     }
 }
 
@@ -104,9 +117,19 @@ object DnsPreferences {
     private const val KEY_LOCK_PASSWORD = "lock_password"
     private const val KEY_HAS_PASSWORD = "has_password"
     private const val KEY_INSTALL_TIME = "install_timestamp"
+    private const val KEY_SCAN_PAUSE_UNTIL = "scan_pause_until"
 
-    private fun getPrefs(context: Context) = 
-        context.createDeviceProtectedStorageContext().getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+    @Volatile
+    private var cachedPrefs: SharedPreferences? = null
+
+    // Read on every accessibility event, so the device-protected context wrapper is built once.
+    private fun getPrefs(context: Context): SharedPreferences =
+        cachedPrefs ?: synchronized(this) {
+            cachedPrefs ?: context.applicationContext
+                .createDeviceProtectedStorageContext()
+                .getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                .also { cachedPrefs = it }
+        }
 
     fun saveDnsState(
         context: Context,
@@ -196,6 +219,14 @@ object DnsPreferences {
             .apply()
     }
 
+    /** Suspends adult-content scanning only; DNS and uninstall protection stay armed. */
+    fun pauseContentScanning(context: Context, untilMillis: Long) {
+        getPrefs(context).edit().putLong(KEY_SCAN_PAUSE_UNTIL, untilMillis).apply()
+    }
+
+    fun getContentScanPauseUntil(context: Context): Long =
+        getPrefs(context).getLong(KEY_SCAN_PAUSE_UNTIL, 0L)
+
     fun getDnsName(context: Context): String =
         getPrefs(context).getString(KEY_DNS_NAME, "") ?: ""
 
@@ -281,9 +312,11 @@ data class DnsProvider(val name: String, val hostname: String, val description: 
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DnsControlScreen() {
+fun DnsControlScreen(isForeground: Boolean = true) {
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
+    val dateFormatter = remember { SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.getDefault()) }
+    val appInstallTime = remember { DnsPreferences.getAppInstallTime(context) }
 
     var dnsName by remember { mutableStateOf(DnsPreferences.getDnsName(context)) }
     var expanded by remember { mutableStateOf(false) }
@@ -294,6 +327,7 @@ fun DnsControlScreen() {
 
     var isActive by remember { mutableStateOf(DnsPreferences.isActive(context)) }
     var expiryMillis by remember { mutableLongStateOf(DnsPreferences.getExpiryMillis(context)) }
+    val lastActivation = remember(isActive) { DnsPreferences.getInstallTimestamp(context) }
 
     // Password states
     var usePasswordToggle by remember { mutableStateOf(false) }
@@ -305,6 +339,7 @@ fun DnsControlScreen() {
     var showLockConfirmDialog by remember { mutableStateOf(false) }
     var showUnlockPasswordDialog by remember { mutableStateOf(false) }
     var showAccessibilityHelpDialog by remember { mutableStateOf(false) }
+    var showPauseScanDialog by remember { mutableStateOf(false) }
     var unlockPasswordAttempt by remember { mutableStateOf("") }
     var passwordErrorText by remember { mutableStateOf<String?>(null) }
 
@@ -330,24 +365,37 @@ fun DnsControlScreen() {
         if (isEmpty()) append("0m")
     }.trim()
 
-    // Live countdown, Expiry handling & Anti-Tamper Loop
-    LaunchedEffect(isActive) {
-        while (isActive) {
-            currentTimeMillis = System.currentTimeMillis()
+    // Permissions are granted outside the app, so re-read them whenever we return to the front.
+    LaunchedEffect(isForeground) {
+        if (isForeground) {
             isDeviceAdmin = FamilyDeviceAdminReceiver.isDeviceAdmin(context)
             isDeviceOwner = FamilyDeviceAdminReceiver.isDeviceOwner(context)
             isAccessibilityEnabled = AntiUninstallAccessibilityService.isEnabled(context)
+        }
+    }
 
-            if (isActive) {
-                // Check status and update UI, but let DnsForegroundService handle the enforcement
-                if (currentTimeMillis >= expiryMillis) {
-                    isActive = false
-                    hasPasswordActive = false
-                    DnsForegroundService.stop(context)
-                }
+    // Live countdown, Expiry handling & Anti-Tamper Loop
+    LaunchedEffect(isActive, isForeground) {
+        var tick = 0
+        while (isActive && isForeground) {
+            currentTimeMillis = System.currentTimeMillis()
+
+            // Permission state almost never changes; re-query it every 30s instead of every tick.
+            if (tick % 6 == 0) {
+                isDeviceAdmin = FamilyDeviceAdminReceiver.isDeviceAdmin(context)
+                isDeviceOwner = FamilyDeviceAdminReceiver.isDeviceOwner(context)
+                isAccessibilityEnabled = AntiUninstallAccessibilityService.isEnabled(context)
+            }
+            tick++
+
+            // Check status and update UI, but let DnsForegroundService handle the enforcement
+            if (currentTimeMillis >= expiryMillis) {
+                isActive = false
+                hasPasswordActive = false
+                DnsForegroundService.stop(context)
             }
 
-            delay(5000L) // Optimization: Check status every 5s instead of 1s to save battery
+            delay(5000L)
         }
     }
 
@@ -434,6 +482,18 @@ fun DnsControlScreen() {
                                 shape = RoundedCornerShape(12.dp)
                             ) {
                                 Text("🔑 Unlock / Deactivate with Password", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                            }
+
+                            OutlinedButton(
+                                onClick = {
+                                    unlockPasswordAttempt = ""
+                                    passwordErrorText = null
+                                    showPauseScanDialog = true
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text("⏸️ Wrongly blocked? Pause content filter 5 min", fontSize = 12.sp)
                             }
                         } else {
                             Box(
@@ -555,9 +615,8 @@ fun DnsControlScreen() {
                         )
 
                         Spacer(modifier = Modifier.height(6.dp))
-                        val formatter = SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.getDefault())
                         Text(
-                            text = "Unlocks on: ${formatter.format(Date(expiryMillis))}",
+                            text = "Unlocks on: ${dateFormatter.format(Date(expiryMillis))}",
                             fontSize = 12.sp,
                             color = Color.Gray
                         )
@@ -840,12 +899,12 @@ fun DnsControlScreen() {
                     color = Color.Gray
                 )
                 Text(
-                    text = "Last Installation: ${DnsPreferences.getAppInstallTime(context)}",
+                    text = "Last Installation: $appInstallTime",
                     fontSize = 10.sp,
                     color = Color.LightGray
                 )
                 Text(
-                    text = "Last Activation: ${DnsPreferences.getInstallTimestamp(context)}",
+                    text = "Last Activation: $lastActivation",
                     fontSize = 10.sp,
                     color = Color.LightGray
                 )
@@ -917,6 +976,63 @@ fun DnsControlScreen() {
         )
     }
 
+    // --- Pause Content Filter Dialog (False Positive Recovery) ---
+    if (showPauseScanDialog) {
+        AlertDialog(
+            onDismissRequest = { showPauseScanDialog = false },
+            title = { Text("⏸️ Pause Content Filter") },
+            text = {
+                Column {
+                    Text("This pauses adult-content scanning for 5 minutes. DNS filtering and uninstall protection stay fully active.\n")
+                    OutlinedTextField(
+                        value = unlockPasswordAttempt,
+                        onValueChange = {
+                            unlockPasswordAttempt = it
+                            passwordErrorText = null
+                        },
+                        label = { Text("Password") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        isError = passwordErrorText != null,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    if (passwordErrorText != null) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = passwordErrorText ?: "",
+                            color = MaterialTheme.colorScheme.error,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (unlockPasswordAttempt.trim() == DnsPreferences.getPassword(context)) {
+                            showPauseScanDialog = false
+                            DnsPreferences.pauseContentScanning(
+                                context,
+                                System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(5)
+                            )
+                            Toast.makeText(context, "Content filter paused for 5 minutes.", Toast.LENGTH_LONG).show()
+                        } else {
+                            passwordErrorText = "Incorrect password!"
+                        }
+                    }
+                ) {
+                    Text("Pause 5 min")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showPauseScanDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
     // --- Warning Confirmation Dialog Before Locking ---
     if (showLockConfirmDialog) {
         val durationLabelFormatted = buildString {
@@ -927,8 +1043,7 @@ fun DnsControlScreen() {
             if (isEmpty()) append("0 minutes")
         }.trim()
 
-        val futureDate = SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.getDefault())
-            .format(Date(System.currentTimeMillis() + totalDurationMillis))
+        val futureDate = dateFormatter.format(Date(System.currentTimeMillis() + totalDurationMillis))
 
         AlertDialog(
             onDismissRequest = { showLockConfirmDialog = false },
