@@ -12,6 +12,7 @@ import android.os.Looper
 import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
+import java.util.concurrent.atomic.AtomicBoolean
 
 class DnsForegroundService : Service() {
     private var isRunning = false
@@ -21,6 +22,7 @@ class DnsForegroundService : Service() {
     // Track last enforcement to prevent spam
     private var lastEnforcementTime = 0L
     private val ENFORCEMENT_COOLDOWN = 1000L // 1 second cooldown
+    private val enforcementPending = AtomicBoolean(false)
     
     private val dnsObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
         override fun onChange(selfChange: Boolean, uri: Uri?) {
@@ -79,36 +81,42 @@ class DnsForegroundService : Service() {
     // This saves 5-10% battery daily by eliminating 17,280 wake-ups per day
 
     private suspend fun enforceDns() {
-        // Cooldown to prevent excessive enforcement attempts
-        val currentTime = System.currentTimeMillis()
-        if (currentTime - lastEnforcementTime < ENFORCEMENT_COOLDOWN) return
-        lastEnforcementTime = currentTime
-        
-        val context = applicationContext
-        val isLockActive = DnsPreferences.isActive(context)
-        val expiryMillis = DnsPreferences.getExpiryMillis(context)
-        val dnsName = DnsPreferences.getDnsName(context)
+        // Coalesce bursts into one trailing run so no tamper is ever dropped by the cooldown.
+        if (!enforcementPending.compareAndSet(false, true)) return
+        try {
+            val waitMillis = ENFORCEMENT_COOLDOWN - (System.currentTimeMillis() - lastEnforcementTime)
+            if (waitMillis > 0) delay(waitMillis)
+            lastEnforcementTime = System.currentTimeMillis()
 
-        if (isLockActive && currentTime < expiryMillis) {
-            try {
-                val sysMode = Settings.Global.getString(contentResolver, "private_dns_mode")
-                val sysSpecifier = Settings.Global.getString(contentResolver, "private_dns_specifier")
-                
-                // Only apply if actually changed (reduces unnecessary operations)
-                if (sysMode != "hostname" || sysSpecifier != dnsName) {
-                    DnsController.applyDns(context, dnsName)
-                    android.util.Log.d("DnsForegroundService", "DNS restored to $dnsName")
+            val currentTime = lastEnforcementTime
+            val context = applicationContext
+            val isLockActive = DnsPreferences.isActive(context)
+            val expiryMillis = DnsPreferences.getExpiryMillis(context)
+            val dnsName = DnsPreferences.getDnsName(context)
+
+            if (isLockActive && currentTime < expiryMillis) {
+                try {
+                    val sysMode = Settings.Global.getString(contentResolver, "private_dns_mode")
+                    val sysSpecifier = Settings.Global.getString(contentResolver, "private_dns_specifier")
+
+                    // Only apply if actually changed (reduces unnecessary operations)
+                    if (sysMode != "hostname" || sysSpecifier != dnsName) {
+                        DnsController.applyDns(context, dnsName)
+                        android.util.Log.d("DnsForegroundService", "DNS restored to $dnsName")
+                    }
+                } catch (_: Exception) {}
+            } else if (isLockActive && currentTime >= expiryMillis) {
+                // Auto-cleanup on expiry
+                withContext(Dispatchers.Main) {
+                    DnsController.deactivateAndRestorePrevious(context)
+                    FamilyDeviceAdminReceiver.setUninstallBlocked(context, false)
+                    DnsPreferences.saveDnsState(context, dnsName, "0", "7", "0", "0", false, 0L)
+                    DnsPreferences.clearPassword(context)
+                    stopSelf()
                 }
-            } catch (_: Exception) {}
-        } else if (isLockActive && currentTime >= expiryMillis) {
-            // Auto-cleanup on expiry
-            withContext(Dispatchers.Main) {
-                DnsController.deactivateAndRestorePrevious(context)
-                FamilyDeviceAdminReceiver.setUninstallBlocked(context, false)
-                DnsPreferences.saveDnsState(context, dnsName, "0", "7", "0", "0", false, 0L)
-                DnsPreferences.clearPassword(context)
-                stopSelf()
             }
+        } finally {
+            enforcementPending.set(false)
         }
     }
 
