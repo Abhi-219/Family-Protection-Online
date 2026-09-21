@@ -30,7 +30,7 @@ import java.nio.channels.FileChannel
  *  5. Decision: text-only, image-only, or text+image combined
  *
  * Search autocomplete suggestions are scored separately (discounted, no repeat bonus)
- * and are NOT checked against the red list, so typing "theory of sex" doesn't block
+ * and are NOT checked against the red list, so typing an educational phrase doesn't block
  * just because a suggestion row shows something else.
  */
 class SmartContentDetector(private val context: Context) {
@@ -95,21 +95,20 @@ class SmartContentDetector(private val context: Context) {
 
         // Explicit adult sites
         private val EXPLICIT_KEYWORDS = setOf(
-            "pornhub", "xvideos", "xnxx", "redtube", "youporn", "xhamster",
-            "brazzers", "porn.com", "xxx.com", "chaturbate", "onlyfans.com",
-            "pornhd", "tube8", "spankwire", "keezmovies", "pornmd", "eporner",
-            "motherless", "tnaflix", "slutload", "cam4", "bongacams"
+            "site1", "site2", "site3", "site4", "site5", "site6",
+            "site7", "site8", "site9", "site10", "site11",
+            "site12", "site13", "site14", "site15", "site16", "site17",
+            "site18", "site19", "site20", "site21", "site22"
         )
 
-        // RED LIST: one match = block immediately
+        // RED LIST: one match = block immediately. Values are masked for source sharing.
         private val RED_LIST: List<Pair<String, Regex>> = listOf(
-            "handjob", "hanndjob", "hand job", "blowjob", "blow job",
-            "gangbang", "cumshot", "pornstar", "porn star",
-            "porn", "porn video", "hentai", "creampie", "deepthroat", "footjob", "rimjob", "live sex",
-            "anal", "erotic", "nude", "blue film", "jerk off",
-            "xxx", "horny", "whore", "slut", "threesome", "milf",
-            "dick pic", "big dick", "suck dick", "dick sucking", "dick sucker",
-            "black dick", "hard dick"
+            "word1", "word2", "word3", "word4", "word5",
+            "word6", "word7", "word8", "word9",
+            "word10", "word11", "word12", "word13", "word14", "word15", "word16", "word17",
+            "word18", "word19", "word20", "word21", "word22", "word23",
+            "word24", "word25", "word26", "word27", "word28",
+            "word29", "word30", "word31", "word32", "word33"
         ).map { it to buildRegex(it) }
 
         // Words that count as safe/educational context (used to discount soft terms)
@@ -124,47 +123,46 @@ class SmartContentDetector(private val context: Context) {
         )
         // Never discounted by educational context
         private val HARD_PHRASES = setOf(
-            "porn video", "porn", "xxx", "live sex", "adult video", "sex video", "chudai", "hentai","desi sex", "desi porn", "desi sex video", "desi porn video"
+            "word11", "word10", "word34", "word35", "word36", "word37", "word38", "word39", "word40", "word41", "word42", "word43"
         )
 
         // ML Kit labels: exact match only
-        private val NSFW_LABELS = setOf("nudity", "pornography", "erotic", "lingerie", "underwear")
+        private val NSFW_LABELS = setOf("label1", "label2", "label3", "label4", "label5")
 
         // Scoring patterns (terms already on the RED_LIST are handled there and omitted here)
         private val TEXT_PATTERNS = listOf(
             // strong
-            TextPattern("porn video", 0.95f), TextPattern("porn", 0.9f),
-            TextPattern("p0rn", 0.9f), TextPattern("pr0n", 0.9f),
-            TextPattern("adult video", 0.9f), TextPattern("chudai", 0.9f),
-            TextPattern("sex video", 0.85f), TextPattern("desi sex", 0.85f),
-            TextPattern("desi porn", 0.95f), TextPattern("desi sex video", 0.9f),
-            TextPattern("desi porn video", 0.95f),
-            TextPattern("anal sex", 0.85f), TextPattern("sex tape", 0.8f),
-            TextPattern("sex chat", 0.8f), TextPattern("orgy", 0.8f),
-            TextPattern("nudes", 0.8f), TextPattern("rule 34", 0.8f),
-            TextPattern("cam girl", 0.8f), TextPattern("camgirl", 0.8f),
-            TextPattern("adult content", 0.8f), TextPattern("confirm you are 18", 0.8f),
-            TextPattern("must be 18", 0.8f), TextPattern("over 18 only", 0.8f),
-            TextPattern("naked", 0.7f), TextPattern("explicit", 0.7f),
-            TextPattern("sexual content", 0.7f), TextPattern("verify your age", 0.7f),
-            TextPattern("masturbate", 0.7f), TextPattern("dildo", 0.7f), TextPattern("bdsm", 0.7f),
-            TextPattern("webcam", 0.6f), TextPattern("age verification", 0.6f),
-            TextPattern("bf video", 0.6f),
+            TextPattern("word11", 0.95f), TextPattern("word10", 0.9f),
+            TextPattern("word44", 0.9f), TextPattern("word45", 0.9f),
+            TextPattern("word36", 0.9f), TextPattern("word38", 0.9f),
+            TextPattern("word37", 0.85f), TextPattern("word39", 0.85f),
+            TextPattern("word40", 0.95f), TextPattern("word41", 0.9f),
+            TextPattern("word42", 0.95f),
+            TextPattern("word46", 0.85f), TextPattern("word47", 0.8f),
+            TextPattern("word48", 0.8f), TextPattern("word49", 0.8f),
+            TextPattern("word50", 0.8f), TextPattern("word51", 0.8f),
+            TextPattern("word52", 0.8f), TextPattern("word53", 0.8f),
+            TextPattern("word54", 0.8f), TextPattern("word55", 0.8f),
+            TextPattern("word56", 0.7f), TextPattern("word57", 0.7f),
+            TextPattern("word58", 0.7f), TextPattern("word59", 0.7f),
+            TextPattern("word60", 0.7f), TextPattern("word61", 0.7f), TextPattern("word62", 0.7f),
+            TextPattern("word63", 0.6f), TextPattern("word64", 0.6f),
+            TextPattern("word65", 0.6f),
             // ambiguous (loosened)
-            TextPattern("pussy", 0.5f), TextPattern("cum", 0.4f), TextPattern("cumming", 0.4f),
-            TextPattern("squirt", 0.4f), TextPattern("squirting", 0.4f),
-            TextPattern("tits", 0.4f), TextPattern("titties", 0.4f),
-            TextPattern("masturbation", 0.4f), TextPattern("oral sex", 0.4f),
-            TextPattern("sex", 0.3f), TextPattern("s3x", 0.3f), TextPattern("boobs", 0.3f),
-            TextPattern("cock", 0.3f), TextPattern("orgasm", 0.3f),
-            TextPattern("fetish", 0.3f), TextPattern("vibrator", 0.3f),
+            TextPattern("word66", 0.5f), TextPattern("word67", 0.4f), TextPattern("word68", 0.4f),
+            TextPattern("word69", 0.4f), TextPattern("word70", 0.4f),
+            TextPattern("word71", 0.4f), TextPattern("word72", 0.4f),
+            TextPattern("word73", 0.4f), TextPattern("word74", 0.4f),
+            TextPattern("word75", 0.3f), TextPattern("word76", 0.3f), TextPattern("word77", 0.3f),
+            TextPattern("word78", 0.3f), TextPattern("word79", 0.3f),
+            TextPattern("word80", 0.3f), TextPattern("word81", 0.3f),
             // weak: counted only if a strong pattern also matched
-            TextPattern("cam", 0.5f, weak = true), TextPattern("adult", 0.4f, weak = true),
-            TextPattern("hookup", 0.4f, weak = true), TextPattern("escort", 0.4f, weak = true),
-            TextPattern("dick", 0.4f, weak = true), TextPattern("ass", 0.3f, weak = true),
-            TextPattern("sexy", 0.3f, weak = true), TextPattern("dating", 0.3f, weak = true),
-            TextPattern("meet singles", 0.3f, weak = true), TextPattern("mature", 0.3f, weak = true),
-            TextPattern("hot", 0.2f, weak = true), TextPattern("18+", 0.1f, weak = true)
+            TextPattern("word82", 0.5f, weak = true), TextPattern("word83", 0.4f, weak = true),
+            TextPattern("word84", 0.4f, weak = true), TextPattern("word85", 0.4f, weak = true),
+            TextPattern("word86", 0.4f, weak = true), TextPattern("word87", 0.3f, weak = true),
+            TextPattern("word88", 0.3f, weak = true), TextPattern("word89", 0.3f, weak = true),
+            TextPattern("word90", 0.3f, weak = true), TextPattern("word91", 0.3f, weak = true),
+            TextPattern("word92", 0.2f, weak = true), TextPattern("word93", 0.1f, weak = true)
         )
     }
 
@@ -315,7 +313,7 @@ class SmartContentDetector(private val context: Context) {
             if (c > 0) counts[p] = c
         }
 
-        // Drop a pattern if a longer matched pattern contains it ("porn" inside "porn video")
+        // Drop a pattern if a longer matched pattern contains it.
         val kept = counts.filter { (p, _) ->
             counts.keys.none { o -> o !== p && o.phrase.length > p.phrase.length && o.phrase.contains(p.phrase) }
         }
