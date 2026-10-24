@@ -1,4 +1,4 @@
-package com.example.family
+package com.abhi.familyprotection
 
 import android.app.AlarmManager
 import android.app.PendingIntent
@@ -12,7 +12,7 @@ import android.util.Log
 class DnsExpiryReceiver : BroadcastReceiver() {
     companion object {
         private const val TAG = "DnsExpiryReceiver"
-        const val ACTION_DEACTIVATE_DNS = "com.example.family.ACTION_DEACTIVATE_DNS"
+        const val ACTION_DEACTIVATE_DNS = "com.abhi.familyprotection.ACTION_DEACTIVATE_DNS"
         private const val REQUEST_CODE = 1001
 
         fun scheduleExpiryAlarm(context: Context, expiryMillis: Long) {

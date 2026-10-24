@@ -1,4 +1,6 @@
-package com.example.family
+package com.abhi.familyprotection
+
+import com.abhi.familyprotection.ui.theme.FamilyTheme
 
 import android.app.admin.DevicePolicyManager
 import android.content.Context
@@ -36,16 +38,22 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationDrawerItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
@@ -55,6 +63,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -72,8 +81,9 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.family.ui.theme.FamilyTheme
+import com.abhi.familyprotection.ui.theme.FamilyTheme
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -118,6 +128,57 @@ object DnsPreferences {
     private const val KEY_HAS_PASSWORD = "has_password"
     private const val KEY_INSTALL_TIME = "install_timestamp"
     private const val KEY_SCAN_PAUSE_UNTIL = "scan_pause_until"
+    private const val KEY_SMS_ALERTS_ENABLED = "sms_alerts_enabled"
+    private const val KEY_BANKING_PAUSE_UNTIL = "banking_pause_until"
+    private const val KEY_BANKING_PAUSE_COOLDOWN_UNTIL = "banking_pause_cooldown_until"
+
+    fun areSmsAlertsEnabled(context: Context): Boolean =
+        getPrefs(context).getBoolean(KEY_SMS_ALERTS_ENABLED, false)
+
+    fun setSmsAlertsEnabled(context: Context, enabled: Boolean) {
+        getPrefs(context).edit().putBoolean(KEY_SMS_ALERTS_ENABLED, enabled).apply()
+    }
+
+    fun getBankingPauseUntil(context: Context): Long =
+        getPrefs(context).getLong(KEY_BANKING_PAUSE_UNTIL, 0L)
+
+    fun getBankingPauseCooldownUntil(context: Context): Long =
+        getPrefs(context).getLong(KEY_BANKING_PAUSE_COOLDOWN_UNTIL, 0L)
+
+    fun isBankingPauseActive(context: Context): Boolean =
+        System.currentTimeMillis() < getBankingPauseUntil(context) &&
+            !AntiUninstallAccessibilityService.isEnabled(context)
+
+    fun isOnBankingPauseCooldown(context: Context): Boolean =
+        System.currentTimeMillis() < getBankingPauseCooldownUntil(context)
+
+    @Synchronized
+    fun startBankingPause(context: Context): BankingPauseStartResult {
+        val now = System.currentTimeMillis()
+        val cooldownUntil = getBankingPauseCooldownUntil(context)
+        if (now < cooldownUntil || BankingAccessibilityPause.hasPendingRestore(context)) {
+            return BankingPauseStartResult.COOLDOWN_ACTIVE
+        }
+        val pauseUntil = now + (15 * 60 * 1000L) // 15 minutes
+        val newCooldown = pauseUntil + (24 * 60 * 60 * 1000L) // 24 hours cooldown after pause
+        val pausePrefs = getPrefs(context)
+        if (!pausePrefs.edit()
+            .putLong(KEY_BANKING_PAUSE_UNTIL, pauseUntil)
+            .putLong(KEY_BANKING_PAUSE_COOLDOWN_UNTIL, newCooldown)
+            .commit()
+        ) {
+            return BankingPauseStartResult.SETTING_WRITE_FAILED
+        }
+
+        val startResult = BankingAccessibilityPause.start(context, pauseUntil)
+        if (startResult != BankingPauseStartResult.STARTED) {
+            pausePrefs.edit()
+                .remove(KEY_BANKING_PAUSE_UNTIL)
+                .remove(KEY_BANKING_PAUSE_COOLDOWN_UNTIL)
+                .commit()
+        }
+        return startResult
+    }
 
     @Volatile
     private var cachedPrefs: SharedPreferences? = null
@@ -334,12 +395,20 @@ fun DnsControlScreen(isForeground: Boolean = true) {
     var passwordInput by remember { mutableStateOf("") }
     var hasPasswordActive by remember { mutableStateOf(DnsPreferences.hasPassword(context)) }
 
+    var selectedMainTab by remember { mutableStateOf(0) } // 0 = DNS Protection, 1 = Accessibility Protection
+    var selectedSettingsPage by remember { mutableStateOf<SettingsPage?>(null) }
+    val drawerState = androidx.compose.material3.rememberDrawerState(DrawerValue.Closed)
+    val coroutineScope = rememberCoroutineScope()
+    var isBankingPaused by remember { mutableStateOf(DnsPreferences.isBankingPauseActive(context)) }
+    var bankingPauseRemainingSec by remember { mutableLongStateOf(maxOf(0L, (DnsPreferences.getBankingPauseUntil(context) - System.currentTimeMillis()) / 1000L)) }
+    var isOnBankingCooldown by remember { mutableStateOf(DnsPreferences.isOnBankingPauseCooldown(context)) }
+    var bankingCooldownRemainingSec by remember { mutableLongStateOf(maxOf(0L, (DnsPreferences.getBankingPauseCooldownUntil(context) - System.currentTimeMillis()) / 1000L)) }
+
     // Dialog states
     var showPermissionDialog by remember { mutableStateOf(false) }
     var showLockConfirmDialog by remember { mutableStateOf(false) }
     var showUnlockPasswordDialog by remember { mutableStateOf(false) }
     var showAccessibilityHelpDialog by remember { mutableStateOf(false) }
-    var showPauseScanDialog by remember { mutableStateOf(false) }
     var unlockPasswordAttempt by remember { mutableStateOf("") }
     var passwordErrorText by remember { mutableStateOf<String?>(null) }
 
@@ -371,6 +440,23 @@ fun DnsControlScreen(isForeground: Boolean = true) {
             isDeviceAdmin = FamilyDeviceAdminReceiver.isDeviceAdmin(context)
             isDeviceOwner = FamilyDeviceAdminReceiver.isDeviceOwner(context)
             isAccessibilityEnabled = AntiUninstallAccessibilityService.isEnabled(context)
+            while (true) {
+                val now = System.currentTimeMillis()
+                currentTimeMillis = now
+                isAccessibilityEnabled = AntiUninstallAccessibilityService.isEnabled(context)
+                isBankingPaused = now < DnsPreferences.getBankingPauseUntil(context) &&
+                    !isAccessibilityEnabled
+                bankingPauseRemainingSec = maxOf(
+                    0L,
+                    (DnsPreferences.getBankingPauseUntil(context) - now) / 1000L
+                )
+                isOnBankingCooldown = now < DnsPreferences.getBankingPauseCooldownUntil(context)
+                bankingCooldownRemainingSec = maxOf(
+                    0L,
+                    (DnsPreferences.getBankingPauseCooldownUntil(context) - now) / 1000L
+                )
+                delay(1000L)
+            }
         }
     }
 
@@ -399,10 +485,53 @@ fun DnsControlScreen(isForeground: Boolean = true) {
         }
     }
 
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ModalDrawerSheet {
+                Text(
+                    "Settings",
+                    modifier = Modifier.padding(16.dp),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp
+                )
+                NavigationDrawerItem(
+                    label = { Text("Protection") },
+                    selected = selectedSettingsPage == null,
+                    onClick = {
+                        selectedSettingsPage = null
+                        coroutineScope.launch { drawerState.close() }
+                    },
+                    modifier = Modifier.padding(horizontal = 12.dp)
+                )
+                SettingsPage.values().forEach { page ->
+                    NavigationDrawerItem(
+                        label = { Text(page.title) },
+                        selected = selectedSettingsPage == page,
+                        onClick = {
+                            selectedSettingsPage = page
+                            coroutineScope.launch { drawerState.close() }
+                        },
+                        modifier = Modifier.padding(horizontal = 12.dp)
+                    )
+                }
+            }
+        }
+    ) {
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
-                title = { Text("Family DNS & Uninstall Guard", fontWeight = FontWeight.Bold) },
+                navigationIcon = {
+                    TextButton(onClick = { coroutineScope.launch { drawerState.open() } }) {
+                        Text("☰", fontSize = 20.sp)
+                    }
+                },
+                title = {
+                    Text(
+                        selectedSettingsPage?.let { "Settings · ${it.title}" } ?: "Family DNS & Uninstall Guard",
+                        fontWeight = FontWeight.Bold
+                    )
+                },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer,
                     titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
@@ -411,6 +540,7 @@ fun DnsControlScreen(isForeground: Boolean = true) {
         },
         // Pinned Bottom Bar: ALWAYS 100% visible regardless of scroll or password toggle!
         bottomBar = {
+            if (selectedSettingsPage == null) {
             Surface(
                 tonalElevation = 3.dp,
                 shadowElevation = 8.dp,
@@ -423,114 +553,178 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                         .padding(horizontal = 20.dp, vertical = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    if (!isActive) {
-                        if (!isAccessibilityEnabled) {
-                            Text(
-                                text = "⚠️ THE MOST IMPORTANT STEP: Enable the Guard in Accessibility Settings before locking!",
-                                color = Color.Red,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                        }
-                        
-                        Button(
-                            onClick = {
-                                if (!isAccessibilityEnabled) {
-                                    Toast.makeText(context, "MANDATORY: Please Enable Guard in Settings first!", Toast.LENGTH_LONG).show()
-                                    showAccessibilityHelpDialog = true
-                                    return@Button
-                                }
-                                
-                                val trimmedDns = dnsName.trim()
-
-                                if (trimmedDns.isEmpty()) {
-                                    Toast.makeText(context, "Please enter a valid DNS hostname", Toast.LENGTH_SHORT).show()
-                                    return@Button
-                                }
-                                if (totalDurationMillis <= 0L) {
-                                    Toast.makeText(context, "Please set at least 1 minute duration", Toast.LENGTH_SHORT).show()
-                                    return@Button
-                                }
-                                if (usePasswordToggle && passwordInput.trim().isEmpty()) {
-                                    Toast.makeText(context, "Please enter a password or disable the password toggle", Toast.LENGTH_LONG).show()
-                                    return@Button
-                                }
-
-                                showLockConfirmDialog = true
-                            },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(52.dp),
-                            shape = RoundedCornerShape(12.dp)
-                        ) {
-                            Text("Lock & Activate for $durationLabel", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-                        }
-                    } else {
-                        if (hasPasswordActive) {
+                    if (selectedMainTab == 0) {
+                        // --- Part 1: DNS Protection Bottom Bar Actions ---
+                        if (!isActive) {
                             Button(
                                 onClick = {
-                                    unlockPasswordAttempt = ""
-                                    passwordErrorText = null
-                                    showUnlockPasswordDialog = true
+                                    val trimmedDns = dnsName.trim()
+
+                                    if (trimmedDns.isEmpty()) {
+                                        Toast.makeText(context, "Please enter a valid DNS hostname", Toast.LENGTH_SHORT).show()
+                                        return@Button
+                                    }
+                                    if (totalDurationMillis <= 0L) {
+                                        Toast.makeText(context, "Please set at least 1 minute duration", Toast.LENGTH_SHORT).show()
+                                        return@Button
+                                    }
+                                    if (usePasswordToggle && passwordInput.trim().isEmpty()) {
+                                        Toast.makeText(context, "Please enter a password or disable the password toggle", Toast.LENGTH_LONG).show()
+                                        return@Button
+                                    }
+
+                                    showLockConfirmDialog = true
                                 },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .height(52.dp),
                                 shape = RoundedCornerShape(12.dp)
                             ) {
-                                Text("🔑 Unlock / Deactivate with Password", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                                Text("Lock & Activate DNS for $durationLabel", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
                             }
+                        } else {
+                            if (hasPasswordActive) {
+                                Button(
+                                    onClick = {
+                                        unlockPasswordAttempt = ""
+                                        passwordErrorText = null
+                                        showUnlockPasswordDialog = true
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(52.dp),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Text("🔑 Unlock / Deactivate DNS with Password", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(Color(0xFFE0E0E0), shape = RoundedCornerShape(12.dp))
+                                        .padding(vertical = 14.dp, horizontal = 16.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = "🔒 DNS Locked for Whole Period",
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color(0xFF616161),
+                                        fontSize = 14.sp,
+                                        textAlign = TextAlign.Center
+                                    )
+                                }
+                            }
+                        }
 
+                        // Emergency Restore Button (DNS Tab)
+                        OutlinedButton(
+                            onClick = {
+                                FamilyDeviceAdminReceiver.setUninstallBlocked(context, false)
+                                DnsController.deactivateAndRestorePrevious(context)
+                                Toast.makeText(context, "System restrictions cleared and settings restored!", Toast.LENGTH_LONG).show()
+                            },
+                            enabled = !isActive,
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                contentColor = Color.Red,
+                                disabledContentColor = Color.LightGray
+                            )
+                        ) {
+                            Text("⚠️ Stuck? Force Restore System Settings", fontSize = 12.sp)
+                        }
+                    } else {
+                        // --- Part 2: Accessibility Bottom Bar Actions (15 Mins Pause) ---
+                        if (isBankingPaused) {
+                            val mins = bankingPauseRemainingSec / 60L
+                            val secs = bankingPauseRemainingSec % 60L
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Text(
+                                        "⚡ Accessibility Paused (${mins}m ${secs}s left)",
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp,
+                                        color = Color(0xFF2E7D32)
+                                    )
+                                    Text(
+                                        "Accessibility will automatically re-enable when the timer ends.",
+                                        fontSize = 11.sp,
+                                        color = Color.DarkGray
+                                    )
+                                }
+                            }
+                        } else if (isOnBankingCooldown) {
+                            val hours = bankingCooldownRemainingSec / 3600L
+                            val mins = (bankingCooldownRemainingSec % 3600L) / 60L
+                            val secs = bankingCooldownRemainingSec % 60L
+                            val cooldownText = if (hours > 0) "${hours}h ${mins}m" else "${mins}m ${secs}s"
                             OutlinedButton(
                                 onClick = {
-                                    unlockPasswordAttempt = ""
-                                    passwordErrorText = null
-                                    showPauseScanDialog = true
+                                    Toast.makeText(
+                                        context,
+                                        "24-Hour Cooldown Active. Next pause available in $cooldownText",
+                                        Toast.LENGTH_LONG
+                                    ).show()
                                 },
+                                enabled = false,
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = RoundedCornerShape(12.dp)
                             ) {
-                                Text("⏸️ Wrongly blocked? Pause content filter 5 min", fontSize = 12.sp)
+                                Text("⏳ 24h Cooldown Active ($cooldownText left)", fontSize = 12.sp, color = Color.Gray)
                             }
                         } else {
-                            Box(
+                            Button(
+                                onClick = {
+                                    when (DnsPreferences.startBankingPause(context)) {
+                                        BankingPauseStartResult.STARTED -> {
+                                            val now = System.currentTimeMillis()
+                                            isBankingPaused = true
+                                            bankingPauseRemainingSec = maxOf(
+                                                0L,
+                                                (DnsPreferences.getBankingPauseUntil(context) - now) / 1000L
+                                            )
+                                            isOnBankingCooldown = true
+                                            bankingCooldownRemainingSec = maxOf(
+                                                0L,
+                                                (DnsPreferences.getBankingPauseCooldownUntil(context) - now) / 1000L
+                                            )
+                                            isAccessibilityEnabled = false
+                                            Toast.makeText(
+                                                context,
+                                                "Accessibility disabled for 15 minutes. A 24-hour cooldown follows.",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                        BankingPauseStartResult.COOLDOWN_ACTIVE -> {
+                                            isOnBankingCooldown = true
+                                            bankingCooldownRemainingSec = maxOf(
+                                                0L,
+                                                (DnsPreferences.getBankingPauseCooldownUntil(context) - System.currentTimeMillis()) / 1000L
+                                            )
+                                        }
+                                        BankingPauseStartResult.SERVICE_NOT_ENABLED ->
+                                            Toast.makeText(context, "Enable this app's Accessibility service first.", Toast.LENGTH_LONG).show()
+                                        BankingPauseStartResult.WRITE_PERMISSION_MISSING ->
+                                            Toast.makeText(context, "The required secure-settings permission is not granted.", Toast.LENGTH_LONG).show()
+                                        BankingPauseStartResult.SETTING_WRITE_FAILED ->
+                                            Toast.makeText(context, "Could not disable Accessibility. Check the app log for details.", Toast.LENGTH_LONG).show()
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F)),
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .background(Color(0xFFE0E0E0), shape = RoundedCornerShape(12.dp))
-                                    .padding(vertical = 14.dp, horizontal = 16.dp),
-                                contentAlignment = Alignment.Center
+                                    .height(52.dp),
+                                shape = RoundedCornerShape(12.dp)
                             ) {
-                                Text(
-                                    text = "🔒 Locked & Non-Uninstallable Until Expiry",
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color(0xFF616161),
-                                    fontSize = 14.sp,
-                                    textAlign = TextAlign.Center
-                                )
+                                Text("🛑 Disable Accessibility for 15 Mins (24h Cooldown)", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                             }
                         }
                     }
-
-                    // Emergency Restore Button (Always visible, disabled when lock is active)
-                    OutlinedButton(
-                        onClick = {
-                            FamilyDeviceAdminReceiver.setUninstallBlocked(context, false)
-                            DnsController.deactivateAndRestorePrevious(context)
-                            Toast.makeText(context, "System restrictions cleared and settings restored!", Toast.LENGTH_LONG).show()
-                        },
-                        enabled = !isActive,
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            contentColor = Color.Red,
-                            disabledContentColor = Color.LightGray
-                        )
-                    ) {
-                        Text("⚠️ Stuck? Force Restore System Settings", fontSize = 12.sp)
-                    }
                 }
+            }
             }
         }
     ) { innerPadding ->
@@ -542,6 +736,15 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            if (selectedSettingsPage != null) {
+                selectedSettingsPage?.let { page ->
+                    SettingsSidebarContent(
+                        page = page,
+                        isProtectionLocked = (isActive && currentTimeMillis < expiryMillis) ||
+                            currentTimeMillis < DnsPreferences.getBankingPauseUntil(context)
+                    )
+                }
+            } else {
             // --- Logo Section ---
             Box(
                 modifier = Modifier
@@ -563,6 +766,28 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                 }
             }
 
+            // --- 2 Prominent Separate Tabs ---
+            TabRow(
+                selectedTabIndex = selectedMainTab,
+                containerColor = Color(0xFFE2E8F0),
+                contentColor = Color.Black,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+            ) {
+                Tab(
+                    selected = selectedMainTab == 0,
+                    onClick = { selectedMainTab = 0 },
+                    text = { Text("🌐 1. DNS Protection", fontWeight = FontWeight.Bold, fontSize = 13.sp) }
+                )
+                Tab(
+                    selected = selectedMainTab == 1,
+                    onClick = { selectedMainTab = 1 },
+                    text = { Text("🛡️ 2. Accessibility", fontWeight = FontWeight.Bold, fontSize = 13.sp) }
+                )
+            }
+
+            if (selectedMainTab == 0) {
             // --- Status & Strict Lock Card ---
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -885,6 +1110,49 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                 }
             }
 
+            } // closes if (selectedMainTab == 0)
+            else {
+                // ==========================================
+                // PART 2: ACCESSIBILITY PROTECTION TAB
+                // ==========================================
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (isDeviceOwner || isAccessibilityEnabled) Color(0xFFE8F5E9) else Color(0xFFFFF8E1)
+                    )
+                ) {
+                    Column(modifier = Modifier.fillMaxWidth().padding(14.dp)) {
+                        Text(
+                            text = if (isDeviceOwner) "🛡️ Anti-Uninstall Guard: HARDWARE ARMED"
+                            else if (isAccessibilityEnabled) "🛡️ Anti-Uninstall Guard: ACTIVE"
+                            else "⚠️ Anti-Uninstall Guard: NOT ENABLED",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            color = if (isDeviceOwner || isAccessibilityEnabled) Color(0xFF2E7D32) else Color(0xFFE65100)
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = if (isAccessibilityEnabled) "Active Accessibility Guard prevents unauthorized uninstallation or tampering in Settings."
+                            else "Enable Accessibility Guard so this app cannot be uninstalled during protection schedules.",
+                            fontSize = 12.sp,
+                            color = Color.DarkGray
+                        )
+
+                        if (!isAccessibilityEnabled) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = { showAccessibilityHelpDialog = true },
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Enable Guard in Accessibility Settings", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+            }
+
             Spacer(modifier = Modifier.height(16.dp))
 
             // --- Footer Info ---
@@ -911,6 +1179,7 @@ fun DnsControlScreen(isForeground: Boolean = true) {
             }
 
             Spacer(modifier = Modifier.height(8.dp))
+            }
         }
     }
 
@@ -970,63 +1239,6 @@ fun DnsControlScreen(isForeground: Boolean = true) {
             },
             dismissButton = {
                 TextButton(onClick = { showUnlockPasswordDialog = false }) {
-                    Text("Cancel")
-                }
-            }
-        )
-    }
-
-    // --- Pause Content Filter Dialog (False Positive Recovery) ---
-    if (showPauseScanDialog) {
-        AlertDialog(
-            onDismissRequest = { showPauseScanDialog = false },
-            title = { Text("⏸️ Pause Content Filter") },
-            text = {
-                Column {
-                    Text("This pauses adult-content scanning for 5 minutes. DNS filtering and uninstall protection stay fully active.\n")
-                    OutlinedTextField(
-                        value = unlockPasswordAttempt,
-                        onValueChange = {
-                            unlockPasswordAttempt = it
-                            passwordErrorText = null
-                        },
-                        label = { Text("Password") },
-                        singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                        isError = passwordErrorText != null,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    if (passwordErrorText != null) {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = passwordErrorText ?: "",
-                            color = MaterialTheme.colorScheme.error,
-                            fontSize = 12.sp
-                        )
-                    }
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        if (unlockPasswordAttempt.trim() == DnsPreferences.getPassword(context)) {
-                            showPauseScanDialog = false
-                            DnsPreferences.pauseContentScanning(
-                                context,
-                                System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(5)
-                            )
-                            Toast.makeText(context, "Content filter paused for 5 minutes.", Toast.LENGTH_LONG).show()
-                        } else {
-                            passwordErrorText = "Incorrect password!"
-                        }
-                    }
-                ) {
-                    Text("Pause 5 min")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showPauseScanDialog = false }) {
                     Text("Cancel")
                 }
             }
@@ -1172,5 +1384,6 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                 }
             }
         )
+    }
     }
 }

@@ -1,4 +1,4 @@
-package com.example.family.ui.theme
+package com.abhi.familyprotection.ui.theme
 
 import android.app.Activity
 import android.os.Build

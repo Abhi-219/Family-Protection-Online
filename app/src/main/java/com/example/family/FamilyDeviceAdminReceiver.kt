@@ -1,4 +1,4 @@
-package com.example.family
+package com.abhi.familyprotection
 
 import android.app.admin.DeviceAdminReceiver
 import android.app.admin.DevicePolicyManager
@@ -33,6 +33,7 @@ class FamilyDeviceAdminReceiver : DeviceAdminReceiver() {
         /**
          * Controls uninstalling only this Family app, not other apps on the device.
          */
+        @Suppress("DEPRECATION")
         fun setUninstallBlocked(context: Context, blocked: Boolean) {
             val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager ?: return
             val component = getComponentName(context)
@@ -43,12 +44,27 @@ class FamilyDeviceAdminReceiver : DeviceAdminReceiver() {
                     dpm.clearUserRestriction(component, UserManager.DISALLOW_UNINSTALL_APPS)
                     // This affects only context.packageName.
                     dpm.setUninstallBlocked(component, context.packageName, blocked)
+                    if (!blocked) {
+                        dpm.clearDeviceOwnerApp(context.packageName)
+                    }
                     Log.d(TAG, "Family app uninstall blocked=$blocked; other apps remain uninstallable")
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to set hardware restrictions", e)
             }
         }
+    }
+
+    override fun onEnabled(context: Context, intent: Intent) {
+        super.onEnabled(context, intent)
+        Log.d(TAG, "Device Admin / Owner enabled; blocking uninstall")
+        setUninstallBlocked(context, true)
+    }
+
+    override fun onProfileProvisioningComplete(context: Context, intent: Intent) {
+        super.onProfileProvisioningComplete(context, intent)
+        Log.d(TAG, "Profile provisioning complete; blocking uninstall")
+        setUninstallBlocked(context, true)
     }
 
     override fun onDisableRequested(context: Context, intent: Intent): CharSequence? {

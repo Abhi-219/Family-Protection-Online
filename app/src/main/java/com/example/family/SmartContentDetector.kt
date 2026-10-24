@@ -1,4 +1,4 @@
-package com.example.family
+package com.abhi.familyprotection
 
 import android.content.Context
 import android.graphics.Bitmap
@@ -125,14 +125,8 @@ class SmartContentDetector(private val context: Context) {
         )
 
         // Unambiguous: one hit blocks, even on a whitelisted domain.
-        private val HARD_RED: List<Pair<String, Regex>> = listOf(
-            "handjob", "hanndjob", "hand job", "blowjob", "blow job",
-            "gangbang", "cumshot", "pornstar", "porn star",
-            "porn video", "hentai", "creampie", "deepthroat", "footjob", "rimjob", "live sex",
-            "blue film", "jerk off",
-            "dick pic", "big dick", "suck dick", "dick sucking", "dick sucker",
-            "black dick", "hard dick"
-        ).map { it to buildRegex(it) }
+        private val HARD_RED: List<Pair<String, Regex>> =
+            KeywordPreferences.DEFAULT_HARD_RED.map { it to buildRegex(it) }
 
         // Common in ordinary use, so these need a second signal before they block.
         private val SOFT_RED: List<Pair<String, Regex>> = listOf(
@@ -141,15 +135,8 @@ class SmartContentDetector(private val context: Context) {
         ).map { it to buildRegex(it) }
 
         // Blanked out before any matching so their substrings can never register as a hit.
-        private val EXCEPTIONS: List<Regex> = listOf(
-            "food porn", "car porn", "poverty porn",
-            "naked eye", "naked truth",
-            "horny toad", "horny lizard",
-            "moby dick", "dick van dyke", "dick cheney",
-            "cum laude", "slut shaming",
-            "anal fissure", "anal fistula", "anal cancer", "anal gland",
-            "nude lipstick", "nude heels", "nude shade"
-        ).map { buildRegex(it) }
+        private val EXCEPTIONS: List<Regex> =
+            KeywordPreferences.DEFAULT_EXCEPTIONS.map { buildRegex(it) }
 
         // Words that count as safe/educational context (used to discount soft terms)
         private val SAFE_CONTEXT = setOf(
@@ -229,35 +216,57 @@ class SmartContentDetector(private val context: Context) {
             // Step 1: Extract text, split by source
             val screen = extractScreenText(rootNode)
             val suggestionsVisible = screen.suggestions.isNotBlank()
-            val suggestionText = applyExceptions(screen.suggestions)
+            val suggestionText = TextNormalizer.normalize(applyExceptions(screen.suggestions))
             val queryText = screen.query
             var pageText = screen.page
 
-            // Step 2: assess accessibility text before paying for a screenshot/OCR pass.
-            var mainText = applyExceptions("$queryText $pageText".trim())
-            hardBlock(mainText)?.let { return@withContext it }
+            // Step 2: assess accessibility text with TextNormalizer (decodes leetspeak and symbols)
+            var mainText = TextNormalizer.normalize(applyExceptions("$queryText $pageText".trim()))
+            hardBlock(mainText)?.let {
+                val appName = SmsSender.resolveAppName(context, packageName)
+                val matchedKeywords = it.reason.removePrefix("Red list: ")
+                AppLogger.log(
+                    context,
+                    "[KEYWORD_DETECTION] app=$appName | pkg=$packageName | keywords=$matchedKeywords | reason=${it.reason} | method=${it.method}",
+                    "SmartContentDetector",
+                    "E"
+                )
+                SmsSender.sendKeywordAlert(
+                    context,
+                    SmsSender.resolveAppName(context, packageName),
+                    packageName,
+                    it.reason
+                )
+                return@withContext it
+            }
             var assessment = assessText(packageName, mainText, suggestionText)
-            assessment.immediateResult?.let { return@withContext it }
-
-            // OCR also captures the autocomplete dropdown, so skip it while suggestions are showing.
-            var screenshot: Bitmap? = null
-            if (screenshotProvider != null && !suggestionsVisible) {
-                screenshot = screenshotProvider()
-                val ocr = screenshot?.let { extractImageText(it) }.orEmpty()
-                if (ocr.isNotBlank()) {
-                    pageText = "$pageText ${ocr.lowercase()}"
-                    mainText = applyExceptions("$queryText $pageText".trim())
-                    hardBlock(mainText)?.let { return@withContext it }
-                    assessment = assessText(packageName, mainText, suggestionText)
-                    assessment.immediateResult?.let { return@withContext it }
-                }
+            assessment.immediateResult?.let {
+                val appName = SmsSender.resolveAppName(context, packageName)
+                val matchedKeywords = assessment.mainResult.counts
+                    .filterValues { count -> count > 0 }
+                    .keys
+                    .joinToString(", ") { pattern -> pattern.phrase }
+                AppLogger.log(
+                    context,
+                    "[KEYWORD_DETECTION] app=$appName | pkg=$packageName | keywords=$matchedKeywords | reason=${it.reason} | method=${it.method}",
+                    "SmartContentDetector",
+                    "W"
+                )
+                SmsSender.sendKeywordAlert(
+                    context,
+                    SmsSender.resolveAppName(context, packageName),
+                    packageName,
+                    it.reason
+                )
+                return@withContext it
             }
 
             // Step 3: Image analysis, only when text isn't already decisive.
+            // Redundant OCR removed to save ~50% CPU/battery during browsing.
             val imageScore = if (assessment.effectiveTextScore >= IMAGE_SKIP_TEXT) {
                 0f
             } else {
-                if (screenshot == null) screenshot = screenshotProvider?.invoke()
+                val screenshot = if (!suggestionsVisible) screenshotProvider?.invoke() else null
                 screenshot?.let { analyzeImage(it) } ?: 0f
             }
 
@@ -274,10 +283,21 @@ class SmartContentDetector(private val context: Context) {
             val finalScore = minOf(1f, maxOf(assessment.effectiveTextScore, imageScore))
 
             if (blocked) {
-                Log.w(TAG, "BLOCK $packageName | text=${assessment.effectiveTextScore} image=$imageScore | " +
-                        "soft=${assessment.softHits.joinToString(",")} | " +
-                        "matched=${assessment.mainResult.counts.keys.joinToString { it.phrase }} | " +
-                        "sample=${assessment.mainText.take(160)}")
+                val appName = SmsSender.resolveAppName(context, packageName)
+                val matchedKeywords = assessment.mainResult.counts
+                    .filterValues { count -> count > 0 }
+                    .keys
+                    .joinToString(", ") { pattern -> pattern.phrase }
+                    .ifEmpty { "none (image/content score)" }
+                val logMsg = "[AI_BLOCK] app=$appName | pkg=$packageName | keywords=$matchedKeywords | reason=$reason | confidence=$finalScore | text=${assessment.effectiveTextScore} img=$imageScore"
+                Log.w(TAG, logMsg)
+                AppLogger.log(context, logMsg, "SmartContentDetector", "E")
+                SmsSender.sendKeywordAlert(
+                    context,
+                    SmsSender.resolveAppName(context, packageName),
+                    packageName,
+                    reason ?: "Adult content"
+                )
             } else if (VERBOSE_LOGS) {
                 Log.d(TAG, "Result: package=$packageName | text=${assessment.effectiveTextScore} | image=$imageScore | " +
                         "matched=${assessment.mainResult.counts.keys.joinToString { it.phrase }} | blocked=false")
@@ -365,10 +385,23 @@ class SmartContentDetector(private val context: Context) {
     }
 
     /** Blanks benign phrases so their substrings can't register as a hit. */
+    private fun getCombinedHardRed(): List<Pair<String, Regex>> {
+        val custom = KeywordPreferences.getCustomHardKeywords(context)
+        if (custom.isEmpty()) return HARD_RED
+        return HARD_RED + custom.map { it to KeywordPreferences.buildRegex(it) }
+    }
+
+    private fun getCombinedExceptions(): List<Regex> {
+        val custom = KeywordPreferences.getCustomExceptions(context)
+        if (custom.isEmpty()) return EXCEPTIONS
+        return EXCEPTIONS + custom.map { KeywordPreferences.buildRegex(it) }
+    }
+
+    /** Blanks benign phrases so their substrings can't register as a hit. */
     private fun applyExceptions(text: String): String {
         if (text.isBlank()) return text
         var out = text
-        for (e in EXCEPTIONS) out = e.replace(out, " ")
+        for (e in getCombinedExceptions()) out = e.replace(out, " ")
         return out
     }
 
@@ -383,7 +416,8 @@ class SmartContentDetector(private val context: Context) {
             }
         }
 
-        val hits = HARD_RED.mapNotNull { (phrase, regex) -> phrase.takeIf { regex.containsMatchIn(text) } }
+        val allHard = getCombinedHardRed()
+        val hits = allHard.mapNotNull { (phrase, regex) -> phrase.takeIf { regex.containsMatchIn(text) } }
         if (hits.isNotEmpty()) {
             Log.w(TAG, "HARD RED HIT: ${hits.joinToString(", ")}")
             return DetectionResult(true, 0.97f, "Red list: ${hits.joinToString(", ")}", "redlist")
@@ -420,6 +454,12 @@ class SmartContentDetector(private val context: Context) {
     private suspend fun analyzeImage(bitmap: Bitmap): Float = withContext(Dispatchers.Default) {
         val small = downscale(bitmap, IMAGE_MAX_DIM)
         try {
+            // Fast 0.1ms skin-tone pre-filter: If less than 8% skin tones are detected,
+            // skip heavy neural network inference completely to save CPU and battery.
+            if (!hasSufficientSkinTones(small)) {
+                return@withContext 0f
+            }
+
             val modelScore = analyzeWithNsfwModel(small)
             var labelScore = 0f
 
@@ -444,6 +484,37 @@ class SmartContentDetector(private val context: Context) {
         } finally {
             if (small !== bitmap) small.recycle()
         }
+    }
+
+    /** Fast pixel sampling to check for human skin tones before running TFLite (takes < 0.2ms) */
+    private fun hasSufficientSkinTones(bitmap: Bitmap, minRatio: Float = 0.08f): Boolean {
+        val width = bitmap.width
+        val height = bitmap.height
+        if (width <= 0 || height <= 0) return false
+
+        val step = 4
+        var sampledPixels = 0
+        var skinPixels = 0
+        val pixels = IntArray(width)
+
+        for (y in 0 until height step step) {
+            bitmap.getPixels(pixels, 0, width, 0, y, width, 1)
+            for (x in 0 until width step step) {
+                val color = pixels[x]
+                val r = (color shr 16) and 0xFF
+                val g = (color shr 8) and 0xFF
+                val b = color and 0xFF
+
+                // Standard RGB skin tone range check
+                if (r > 95 && g > 40 && b > 20 &&
+                    (maxOf(r, maxOf(g, b)) - minOf(r, minOf(g, b))) > 15 &&
+                    Math.abs(r - g) > 15 && r > g && r > b) {
+                    skinPixels++
+                }
+                sampledPixels++
+            }
+        }
+        return if (sampledPixels > 0) (skinPixels.toFloat() / sampledPixels) >= minRatio else false
     }
 
     /** Shrinks to [maxDim] on the longest side; returns the original when it already fits. */
@@ -530,6 +601,27 @@ class SmartContentDetector(private val context: Context) {
         return ScreenText(q.toString().lowercase(), s.toString().lowercase(), p.toString().lowercase())
     }
 
+    private fun extractSearchQueryFromUrl(url: String): String? {
+        if (!url.contains("?")) return null
+        return try {
+            val querySection = url.substringAfter("?", "")
+            if (querySection.isBlank()) return null
+            val pairs = querySection.split("&")
+            val queryParams = listOf("q", "search_query", "query", "p", "keyword", "keywords", "search")
+            val results = mutableListOf<String>()
+            for (pair in pairs) {
+                val parts = pair.split("=")
+                if (parts.size >= 2 && queryParams.contains(parts[0].lowercase())) {
+                    val decoded = java.net.URLDecoder.decode(parts[1], "UTF-8").replace("+", " ")
+                    results.add(decoded)
+                }
+            }
+            if (results.isNotEmpty()) results.joinToString(" ") else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun collect(node: AccessibilityNodeInfo, q: StringBuilder, s: StringBuilder, p: StringBuilder) {
         val id = (node.viewIdResourceName ?: "").lowercase()
         val texts = listOfNotNull(node.text?.toString(), node.contentDescription?.toString())
@@ -538,7 +630,12 @@ class SmartContentDetector(private val context: Context) {
         for (t in texts) {
             if (DEBUG_NODE_IDS) Log.d(TAG, "NODE id=$id class=${node.className} text=${t.take(40)}")
             when {
-                URL_BAR_IDS.any { id.contains(it) } || node.isEditable -> q.append(t).append(' ')
+                URL_BAR_IDS.any { id.contains(it) } || node.isEditable -> {
+                    q.append(t).append(' ')
+                    extractSearchQueryFromUrl(t)?.let { query ->
+                        q.append(query).append(' ')
+                    }
+                }
                 SUGGESTION_IDS.any { id.contains(it) } -> s.append(t).append(' ')
                 else -> p.append(t).append(' ')
             }

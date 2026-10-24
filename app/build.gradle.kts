@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.family"
+    namespace = "com.abhi.familyprotection"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.example.family"
+        applicationId = "com.abhi.familyprotection"
         minSdk = 30
         targetSdk = 35
         versionCode = 1
@@ -19,10 +19,38 @@ android {
 
     buildTypes {
         release {
-            optimization {
-                enable = false
-            }
+
+            isMinifyEnabled = true
+            isShrinkResources = true
+            isCrunchPngs = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+
+            //isMinifyEnabled = false
+            //isShrinkResources = false
         }
+    }
+
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("armeabi-v7a", "arm64-v8a")
+            isUniversalApk = false
+        }
+    }
+
+    packaging {
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+    }
+
+    androidResources {
+        localeFilters += listOf("en")
+        noCompress += "tflite"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
@@ -43,10 +71,9 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
 
-    // AI/ML dependencies for content detection (ALL FREE)
-    // Note: ML Kit already includes TensorFlow Lite internally, no need to add it explicitly
-    implementation("com.google.mlkit:image-labeling:17.0.9")
-    implementation("com.google.mlkit:text-recognition:16.0.1")
+    // AI/ML dependencies for content detection (Unbundled Play Services versions for minimal APK size)
+    implementation("com.google.android.gms:play-services-mlkit-image-labeling:16.0.8")
+    implementation("com.google.android.gms:play-services-mlkit-text-recognition:19.0.1")
     implementation("com.google.mlkit:vision-common:17.3.0")
     implementation("com.google.android.gms:play-services-tflite-java:16.4.0")
     
