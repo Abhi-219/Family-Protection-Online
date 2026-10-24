@@ -10,6 +10,8 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -88,6 +90,12 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.io.IOException
+import java.security.GeneralSecurityException
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
+import javax.crypto.spec.GCMParameterSpec
 
 class MainActivity : ComponentActivity() {
     private var isForeground by mutableStateOf(true)
@@ -131,6 +139,9 @@ object DnsPreferences {
     private const val KEY_SMS_ALERTS_ENABLED = "sms_alerts_enabled"
     private const val KEY_BANKING_PAUSE_UNTIL = "banking_pause_until"
     private const val KEY_BANKING_PAUSE_COOLDOWN_UNTIL = "banking_pause_cooldown_until"
+    private const val PASSWORD_KEY_ALIAS = "dns_lock_password_key"
+    private const val ENCRYPTED_PASSWORD_PREFIX = "enc:v1:"
+    private const val GCM_IV_LENGTH = 12
 
     fun areSmsAlertsEnabled(context: Context): Boolean =
         getPrefs(context).getBoolean(KEY_SMS_ALERTS_ENABLED, false)
@@ -261,23 +272,90 @@ object DnsPreferences {
     }
 
     fun savePassword(context: Context, password: String) {
-        getPrefs(context).edit()
-            .putString(KEY_LOCK_PASSWORD, password)
+        val encryptedPassword = encryptPassword(password)
+        check(getPrefs(context).edit()
+            .putString(KEY_LOCK_PASSWORD, encryptedPassword)
             .putBoolean(KEY_HAS_PASSWORD, true)
-            .apply()
+            .commit()) { "Unable to save encrypted lock password" }
     }
 
-    fun getPassword(context: Context): String =
-        getPrefs(context).getString(KEY_LOCK_PASSWORD, "") ?: ""
+    fun getPassword(context: Context): String {
+        val prefs = getPrefs(context)
+        val storedPassword = prefs.getString(KEY_LOCK_PASSWORD, "") ?: ""
+        if (storedPassword.isEmpty()) return ""
+        if (storedPassword.startsWith(ENCRYPTED_PASSWORD_PREFIX)) {
+            return decryptPassword(storedPassword.removePrefix(ENCRYPTED_PASSWORD_PREFIX))
+        }
+
+        val encryptedPassword = encryptPassword(storedPassword)
+        check(prefs.edit().putString(KEY_LOCK_PASSWORD, encryptedPassword).commit()) {
+            "Unable to migrate plaintext lock password to encrypted storage"
+        }
+        return storedPassword
+    }
 
     fun hasPassword(context: Context): Boolean =
         getPrefs(context).getBoolean(KEY_HAS_PASSWORD, false)
 
     fun clearPassword(context: Context) {
-        getPrefs(context).edit()
+        check(getPrefs(context).edit()
             .remove(KEY_LOCK_PASSWORD)
             .remove(KEY_HAS_PASSWORD)
-            .apply()
+            .commit()) { "Unable to clear lock password" }
+    }
+
+    private fun encryptPassword(password: String): String {
+        return try {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, getOrCreatePasswordKey())
+            val encrypted = cipher.doFinal(password.toByteArray(Charsets.UTF_8))
+            val payload = cipher.iv + encrypted
+            ENCRYPTED_PASSWORD_PREFIX + android.util.Base64.encodeToString(
+                payload,
+                android.util.Base64.NO_WRAP
+            )
+        } catch (e: GeneralSecurityException) {
+            throw IllegalStateException("Unable to encrypt lock password with Android Keystore", e)
+        } catch (e: IOException) {
+            throw IllegalStateException("Unable to load Android Keystore", e)
+        } catch (e: IllegalArgumentException) {
+            throw IllegalStateException("Unable to encrypt lock password with Android Keystore", e)
+        }
+    }
+
+    private fun decryptPassword(payload: String): String {
+        return try {
+            val bytes = android.util.Base64.decode(payload, android.util.Base64.NO_WRAP)
+            require(bytes.size > GCM_IV_LENGTH) { "Encrypted password payload is invalid" }
+            val iv = bytes.copyOfRange(0, GCM_IV_LENGTH)
+            val encrypted = bytes.copyOfRange(GCM_IV_LENGTH, bytes.size)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, getOrCreatePasswordKey(), GCMParameterSpec(128, iv))
+            String(cipher.doFinal(encrypted), Charsets.UTF_8)
+        } catch (e: GeneralSecurityException) {
+            throw IllegalStateException("Unable to decrypt lock password with Android Keystore", e)
+        } catch (e: IOException) {
+            throw IllegalStateException("Unable to load Android Keystore", e)
+        } catch (e: IllegalArgumentException) {
+            throw IllegalStateException("Unable to decrypt lock password with Android Keystore", e)
+        }
+    }
+
+    private fun getOrCreatePasswordKey(): SecretKey {
+        val keyStore = java.security.KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        (keyStore.getKey(PASSWORD_KEY_ALIAS, null) as? SecretKey)?.let { return it }
+        val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+        keyGenerator.init(
+            KeyGenParameterSpec.Builder(
+                PASSWORD_KEY_ALIAS,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setRandomizedEncryptionRequired(true)
+                .build()
+        )
+        return keyGenerator.generateKey()
     }
 
     /** Suspends adult-content scanning only; DNS and uninstall protection stay armed. */
@@ -1217,20 +1295,27 @@ fun DnsControlScreen(isForeground: Boolean = true) {
             confirmButton = {
                 Button(
                     onClick = {
-                        val savedPassword = DnsPreferences.getPassword(context)
-                        if (unlockPasswordAttempt.trim() == savedPassword) {
-                            showUnlockPasswordDialog = false
-                            DnsController.deactivateAndRestorePrevious(context)
-                            FamilyDeviceAdminReceiver.setUninstallBlocked(context, false)
-                            DnsExpiryReceiver.cancelExpiryAlarm(context)
-                            DnsForegroundService.stop(context)
-                            DnsPreferences.clearPassword(context)
-                            isActive = false
-                            hasPasswordActive = false
-                            DnsPreferences.saveDnsState(context, dnsName, totalYears, totalDays, totalHours, totalMinutes, false, 0L)
-                            Toast.makeText(context, "Password verified! App unlocked and uninstall allowed.", Toast.LENGTH_LONG).show()
-                        } else {
-                            passwordErrorText = "Incorrect password! Lock remains active."
+                        val savedPassword = try {
+                            DnsPreferences.getPassword(context)
+                        } catch (e: IllegalStateException) {
+                            passwordErrorText = "Could not read the saved password. Protection remains active."
+                            null
+                        }
+                        if (savedPassword != null) {
+                            if (unlockPasswordAttempt.trim() == savedPassword) {
+                                showUnlockPasswordDialog = false
+                                DnsController.deactivateAndRestorePrevious(context)
+                                FamilyDeviceAdminReceiver.setUninstallBlocked(context, false)
+                                DnsExpiryReceiver.cancelExpiryAlarm(context)
+                                DnsForegroundService.stop(context)
+                                DnsPreferences.clearPassword(context)
+                                isActive = false
+                                hasPasswordActive = false
+                                DnsPreferences.saveDnsState(context, dnsName, totalYears, totalDays, totalHours, totalMinutes, false, 0L)
+                                Toast.makeText(context, "Password verified! App unlocked and uninstall allowed.", Toast.LENGTH_LONG).show()
+                            } else {
+                                passwordErrorText = "Incorrect password! Lock remains active."
+                            }
                         }
                     }
                 ) {
@@ -1314,7 +1399,7 @@ fun DnsControlScreen(isForeground: Boolean = true) {
 
     // --- ADB Permission Dialog ---
     if (showPermissionDialog) {
-        val adbCommand = "adb shell pm grant com.example.family android.permission.WRITE_SECURE_SETTINGS"
+        val adbCommand = "adb shell pm grant com.abhi.familyprotection android.permission.WRITE_SECURE_SETTINGS"
         AlertDialog(
             onDismissRequest = { showPermissionDialog = false },
             title = { Text("Permission Required") },

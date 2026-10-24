@@ -40,7 +40,7 @@
 
         <receiver
             android:name=".DnsExpiryReceiver"
-            android:exported="true"
+            android:exported="false"
             android:directBootAware="true">
             <intent-filter>
                 <action android:name="com.abhi.familyprotection.ACTION_DEACTIVATE_DNS" />
