@@ -32,25 +32,32 @@ class DnsForegroundService : Service() {
             when (intent.action) {
                 Intent.ACTION_SCREEN_OFF -> {
                     hyperAlertJob?.cancel()
-                    VigilanceWatchdogAlarm.cancel(applicationContext)
                     bankingMonitorJob?.cancel()
-                    val bankingPackage =
-                        BankingAccessibilityPause.automaticBankingPackage(applicationContext)
-                    if (bankingPackage != null) {
-                        val restored = BankingAccessibilityPause.endAutomaticPause(applicationContext)
-                        AppLogger.log(
-                            applicationContext,
-                            "[BANKING] screen off pkg=$bankingPackage accessibilityRestored=$restored",
-                            "DnsForegroundService",
-                            if (restored) "I" else "E"
-                        )
-                        if (!DnsPreferences.isActive(applicationContext)) stopSelf()
+                    serviceScope.launch {
+                        VigilanceWatchdogAlarm.cancel(applicationContext)
+                        val bankingPackage =
+                            BankingAccessibilityPause.automaticBankingPackage(applicationContext)
+                        if (bankingPackage != null) {
+                            val restored = BankingAccessibilityPause.endAutomaticPause(applicationContext)
+                            AppLogger.log(
+                                applicationContext,
+                                "[BANKING] screen off pkg=$bankingPackage accessibilityRestored=$restored",
+                                "DnsForegroundService",
+                                if (restored) "I" else "E"
+                            )
+                            if (!DnsPreferences.isActive(applicationContext)) stopSelf()
+                        }
                     }
                 }
                 Intent.ACTION_SCREEN_ON -> {
-                    serviceScope.launch { enforceDns() }
-                    syncVigilanceState()
-                    ensureBankingForegroundMonitor()
+                    serviceScope.launch {
+                        restoreAccessibilityIfTampered()
+                        enforceDns()
+                    }
+                    serviceScope.launch {
+                        syncVigilanceState()
+                        ensureBankingForegroundMonitor()
+                    }
                 }
             }
         }
@@ -71,25 +78,30 @@ class DnsForegroundService : Service() {
     private val accessibilitySettingsObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
         override fun onChange(selfChange: Boolean, uri: Uri?) {
             super.onChange(selfChange, uri)
-            val now = System.currentTimeMillis()
-            if (!DnsPreferences.isActive(applicationContext) ||
-                now >= DnsPreferences.getExpiryMillis(applicationContext) ||
-                BankingAccessibilityPause.isIntentionalPauseActive(applicationContext, now) ||
-                BankingAccessibilityPause.isAccessibilityEnabled(applicationContext)
-            ) {
-                return
-            }
+            serviceScope.launch { restoreAccessibilityIfTampered() }
+        }
+    }
 
-            Log.w("DnsForegroundService", "Accessibility was disabled during protection; restoring")
-            VigilanceManager.recordViolation(applicationContext, "Accessibility disabled externally")
-            if (!BankingAccessibilityPause.ensureServiceEnabled(applicationContext)) {
-                AppLogger.log(
-                    applicationContext,
-                    "[SELF_RESTORE_FAILED] Could not restore Accessibility service",
-                    "DnsForegroundService",
-                    "E"
-                )
-            }
+    // Also run on screen-on: OEM task killers (Vivo iManager) can disable the service while the screen is off.
+    private fun restoreAccessibilityIfTampered() {
+        val now = System.currentTimeMillis()
+        if (!DnsPreferences.isActive(applicationContext) ||
+            now >= DnsPreferences.getExpiryMillis(applicationContext) ||
+            BankingAccessibilityPause.isIntentionalPauseActive(applicationContext, now) ||
+            BankingAccessibilityPause.isAccessibilityEnabled(applicationContext)
+        ) {
+            return
+        }
+
+        Log.w("DnsForegroundService", "Accessibility was disabled during protection; restoring")
+        VigilanceManager.recordViolation(applicationContext, "Accessibility disabled externally")
+        if (!BankingAccessibilityPause.ensureServiceEnabled(applicationContext)) {
+            AppLogger.log(
+                applicationContext,
+                "[SELF_RESTORE_FAILED] Could not restore Accessibility service",
+                "DnsForegroundService",
+                "E"
+            )
         }
     }
 
@@ -308,16 +320,20 @@ class DnsForegroundService : Service() {
                     null
                 }
                 lastQueryTime = now
+                var restrictedForeground = false
                 if (resumedPackage != null) {
                     foregroundPackage = resumedPackage
                     if (BankingAccessibilityPause.isBankingOrFinancialApp(applicationContext, foregroundPackage)) {
                         nonBankingForegroundSince = null
-                    } else if (nonBankingForegroundSince == null) {
-                        nonBankingForegroundSince = now
+                    } else {
+                        if (nonBankingForegroundSince == null) nonBankingForegroundSince = now
+                        restrictedForeground =
+                            BankingAccessibilityPause.isRestrictedFromPause(applicationContext, foregroundPackage)
                     }
                 }
                 val leftBankingAppAt = nonBankingForegroundSince
-                if (leftBankingAppAt != null && now - leftBankingAppAt >= 2_000L) {
+                // Blocked/supervised apps must not inherit the banking grace period.
+                if (leftBankingAppAt != null && (restrictedForeground || now - leftBankingAppAt >= 2_000L)) {
                     if (BankingAccessibilityPause.endAutomaticPause(applicationContext)) {
                         Log.i(
                             "DnsForegroundService",
@@ -390,15 +406,13 @@ class DnsForegroundService : Service() {
                     )
                 }
             } else if (isLockActive && currentTime >= expiryMillis) {
-                withContext(Dispatchers.Main) {
-                    DnsController.deactivateAndRestorePrevious(context)
-                    FamilyDeviceAdminReceiver.setUninstallBlocked(context, false)
-                    DnsPreferences.saveDnsState(context, dnsName, "0", "7", "0", "0", false, 0L)
-                    DnsPreferences.clearPassword(context)
-                    VigilanceWatchdogAlarm.cancel(context)
-                    WatchdogScheduler.cancel(context)
-                    stopSelf()
-                }
+                DnsController.deactivateAndRestorePrevious(context)
+                FamilyDeviceAdminReceiver.setUninstallBlocked(context, false)
+                DnsPreferences.saveDnsState(context, dnsName, "0", "7", "0", "0", false, 0L)
+                DnsPreferences.clearPassword(context)
+                VigilanceWatchdogAlarm.cancel(context)
+                WatchdogScheduler.cancel(context)
+                stopSelf()
             }
         } finally {
             enforcementPending.set(false)
