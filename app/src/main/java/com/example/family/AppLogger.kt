@@ -6,11 +6,14 @@ import android.os.Process
 import android.util.Log
 import java.io.File
 import java.io.IOException
+import java.text.ParseException
 import java.util.ArrayDeque
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentLinkedDeque
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -29,12 +32,20 @@ object AppLogger {
     private const val MAX_MEMORY_LOGS = 300
     private const val MAX_PENDING_WRITES = 512
     private const val MAX_BATCH_SIZE = 50
-    private const val MAX_LOG_ENTRY_CHARS = 2048
+    private const val MAX_LOG_ENTRY_CHARS = 1024
+    // Trim to well below the cap so the file isn't rewritten on every batch.
+    private const val MAX_FILE_BYTES = 256 * 1024L
+    private const val TRIM_TARGET_BYTES = 128 * 1024L
+    private const val MAX_LOG_AGE_MS = 7 * 24 * 60 * 60 * 1000L
+    private const val AGE_PURGE_INTERVAL_MS = 60 * 60 * 1000L
     private const val LOG_FILE_NAME = "security_terminal_logs.txt"
 
     private data class PendingLog(val file: File, val entry: String, val generation: Long)
 
     private val logQueue = ConcurrentLinkedDeque<String>()
+    // ConcurrentLinkedDeque.size is O(n), so track the count separately.
+    private val memoryCount = AtomicInteger(0)
+    private var lastAgePurgeAt = 0L
     private val timeFormatter = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
     private val fileLock = Any()
     private val persistenceGeneration = AtomicLong(0L)
@@ -46,7 +57,8 @@ object AppLogger {
             for (first in pendingLogs) {
                 val batch = ArrayList<PendingLog>(MAX_BATCH_SIZE)
                 batch.add(first)
-                delay(75L)
+                // Coalesce bursts into fewer flash writes; up to 1s of entries can be lost on a crash.
+                delay(1_000L)
                 while (batch.size < MAX_BATCH_SIZE) {
                     val next = pendingLogs.tryReceive().getOrNull() ?: break
                     batch.add(next)
@@ -92,8 +104,10 @@ object AppLogger {
             try {
                 val file = getLogFile(context)
                 synchronized(fileLock) {
+                    if (file.exists()) trimFile(file)
                     if (file.exists() && logQueue.isEmpty()) {
                         readLastLogLines(file).forEach(logQueue::add)
+                        memoryCount.set(logQueue.size)
                     }
                 }
             } catch (e: IOException) {
@@ -122,8 +136,8 @@ object AppLogger {
         }
 
         logQueue.add(entry)
-        while (logQueue.size > MAX_MEMORY_LOGS) {
-            logQueue.pollFirst()
+        if (memoryCount.incrementAndGet() > MAX_MEMORY_LOGS && logQueue.pollFirst() != null) {
+            memoryCount.decrementAndGet()
         }
 
         context?.let { ctx ->
@@ -144,6 +158,7 @@ object AppLogger {
         synchronized(fileLock) {
             persistenceGeneration.incrementAndGet()
             logQueue.clear()
+            memoryCount.set(0)
             val file = getLogFile(context)
             if (file.exists() && !file.delete()) {
                 throw IOException("Unable to delete the saved app log file")
@@ -159,8 +174,10 @@ object AppLogger {
                 .forEach { (file, entries) ->
                     try {
                         file.appendText(entries.joinToString(separator = "\n", postfix = "\n") { it.entry })
-                        if (file.length() > 100 * 1024L) {
-                            file.writeText(readLastLogLines(file).joinToString(separator = "\n", postfix = "\n"))
+                        val now = System.currentTimeMillis()
+                        if (file.length() > MAX_FILE_BYTES || now - lastAgePurgeAt > AGE_PURGE_INTERVAL_MS) {
+                            lastAgePurgeAt = now
+                            trimFile(file)
                         }
                     } catch (e: IOException) {
                         Log.e("AppLogger", "Unable to persist app log entries", e)
@@ -169,6 +186,47 @@ object AppLogger {
                     }
                 }
         }
+    }
+
+    // Caller must hold fileLock. Keeps the newest entries within TRIM_TARGET_BYTES and MAX_LOG_AGE_MS.
+    private fun trimFile(file: File) {
+        val lines = file.readLines()
+        val cutoff = System.currentTimeMillis() - MAX_LOG_AGE_MS
+        val kept = ArrayList<String>()
+        var bytes = 0L
+        for (i in lines.indices.reversed()) {
+            val line = lines[i].take(MAX_LOG_ENTRY_CHARS)
+            val time = entryTimeMillis(line)
+            if (time != null && time < cutoff) break
+            bytes += line.length + 1
+            if (bytes > TRIM_TARGET_BYTES) break
+            kept.add(line)
+        }
+        if (kept.size == lines.size) return
+        kept.reverse()
+        val tmp = File(file.parentFile, "${file.name}.tmp")
+        tmp.writeText(if (kept.isEmpty()) "" else kept.joinToString(separator = "\n", postfix = "\n"))
+        if (!tmp.renameTo(file)) {
+            file.writeText(tmp.readText())
+            tmp.delete()
+        }
+    }
+
+    // Entries carry "MM-dd HH:mm:ss.SSS" without a year; assume the most recent matching date.
+    private fun entryTimeMillis(line: String): Long? {
+        if (line.length < 18) return null
+        val parsed = try {
+            synchronized(timeFormatter) { timeFormatter.parse(line.substring(0, 18)) }
+        } catch (_: ParseException) {
+            null
+        } ?: return null
+        val now = Calendar.getInstance()
+        val cal = Calendar.getInstance().apply {
+            time = parsed
+            set(Calendar.YEAR, now.get(Calendar.YEAR))
+        }
+        if (cal.after(now)) cal.add(Calendar.YEAR, -1)
+        return cal.timeInMillis
     }
 
     private fun readLastLogLines(file: File): List<String> {
