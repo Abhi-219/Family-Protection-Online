@@ -66,9 +66,12 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
     private val AGGRESSIVE_AI_COOLDOWN = 2000L
     private val MEDIUM_AI_COOLDOWN = 2500L
     private val UNCHANGED_BENIGN_AI_COOLDOWN = 7000L
-    private val AGGRESSIVE_WINDOW = 15 * 60 * 1000L
     private val HOT_AGGRESSIVE_WINDOW = 2 * 60 * 1000L
     private val MEDIUM_AGGRESSIVE_WINDOW = 7 * 60 * 1000L
+    private val ADMIN_STATE_CACHE_MS = 30_000L
+    @Volatile private var adminStateCheckedAt = 0L
+    @Volatile private var cachedIsDeviceAdmin = false
+    @Volatile private var cachedIsDeviceOwner = false
     
     private val tempLockedApps = ConcurrentHashMap<String, Long>()
     private val pipDismissTargets = ConcurrentHashMap<String, Long>()
@@ -261,15 +264,24 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
     private fun getScanCooldown(elapsedSinceBlock: Long): Long = when {
         elapsedSinceBlock < HOT_AGGRESSIVE_WINDOW -> AGGRESSIVE_SCAN_COOLDOWN
         elapsedSinceBlock < MEDIUM_AGGRESSIVE_WINDOW -> MEDIUM_SCAN_COOLDOWN
-        elapsedSinceBlock < AGGRESSIVE_WINDOW -> NORMAL_SCAN_COOLDOWN
         else -> NORMAL_SCAN_COOLDOWN
     }
 
     private fun getAiCooldown(elapsedSinceBlock: Long): Long = when {
         elapsedSinceBlock < HOT_AGGRESSIVE_WINDOW -> AGGRESSIVE_AI_COOLDOWN
         elapsedSinceBlock < MEDIUM_AGGRESSIVE_WINDOW -> MEDIUM_AI_COOLDOWN
-        elapsedSinceBlock < AGGRESSIVE_WINDOW -> NORMAL_AI_COOLDOWN
         else -> NORMAL_AI_COOLDOWN
+    }
+
+    // Admin/owner status rarely changes; avoid a DevicePolicyManager binder call per event.
+    private fun refreshAdminState(): Pair<Boolean, Boolean> {
+        val now = SystemClock.elapsedRealtime()
+        if (now - adminStateCheckedAt >= ADMIN_STATE_CACHE_MS) {
+            cachedIsDeviceAdmin = FamilyDeviceAdminReceiver.isDeviceAdmin(applicationContext)
+            cachedIsDeviceOwner = FamilyDeviceAdminReceiver.isDeviceOwner(applicationContext)
+            adminStateCheckedAt = now
+        }
+        return cachedIsDeviceAdmin to cachedIsDeviceOwner
     }
 
     // Slows only screenshot/AI scans; keyword, block-list and tamper checks stay at full speed.
@@ -293,7 +305,11 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
             pkgName.contains("securitycenter", ignoreCase = true) ||
             pkgName.contains("systemmanager", ignoreCase = true) ||
             pkgName.contains("iqoo.secure", ignoreCase = true) ||
-            pkgName.contains("permissionmanager", ignoreCase = true)
+            pkgName.contains("permissionmanager", ignoreCase = true) ||
+            pkgName.contains("safecenter", ignoreCase = true) ||
+            pkgName.contains("oneplus.security", ignoreCase = true) ||
+            pkgName.contains("samsung.android.lool", ignoreCase = true) ||
+            pkgName.contains("samsung.android.sm", ignoreCase = true)
 
     /** True when the foreground UI is the OS package-installer uninstall confirmation dialog. */
     private fun isPackageInstallerUi(pkgName: String): Boolean =
@@ -358,8 +374,10 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
                 event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
         val isSystemWindowSource = pkgName.contains("launcher", ignoreCase = true) ||
             pkgName.contains("systemui", ignoreCase = true)
+        // Content changes from launcher/systemui are mostly clock and notification ticks.
         val shouldScanAllWindows = (isLockActive || hasLockedWindowTargets) &&
-            (isWindowBoundaryEvent || isSystemWindowSource) &&
+            (isWindowBoundaryEvent ||
+                (isSystemWindowSource && event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)) &&
             now - lastAllWindowsScanTime > 700L &&
             isAllWindowsScanRunning.compareAndSet(false, true)
         if (shouldScanAllWindows) {
@@ -376,7 +394,7 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
                         System.currentTimeMillis() < DnsPreferences.getExpiryMillis(context)
                     val isIntentionalAccessibilityPause =
                         BankingAccessibilityPause.isIntentionalPauseActive(context)
-                    val isDeviceAdminLocal = FamilyDeviceAdminReceiver.isDeviceAdmin(context)
+                    val isDeviceAdminLocal = refreshAdminState().first
 
                     if (lockStillActive && isDeviceAdminLocal && !isIntentionalAccessibilityPause) {
                         checkAllWindowsForTampering(true)
@@ -497,8 +515,7 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         val isDnsLockActive = DnsPreferences.isActive(context) && eventTime < DnsPreferences.getExpiryMillis(context)
 
         // Uninstall & Settings Tamper Checks
-        val isDeviceAdminLocal = FamilyDeviceAdminReceiver.isDeviceAdmin(context)
-        val isDeviceOwner = FamilyDeviceAdminReceiver.isDeviceOwner(context)
+        val (isDeviceAdminLocal, isDeviceOwner) = refreshAdminState()
 
         if (!isDeviceOwner && isDeviceAdminLocal) {
             if (isPackageInstallerUi(pkgName) || isSystemSettingsUi(pkgName)) {
@@ -840,20 +857,24 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
                 Dispatchers.Default.asExecutor(),
                 object : TakeScreenshotCallback {
                     override fun onSuccess(screenshotResult: ScreenshotResult) {
+                        var bitmap: Bitmap? = null
                         try {
                             val hardwareBitmap = Bitmap.wrapHardwareBuffer(
                                 screenshotResult.hardwareBuffer,
                                 screenshotResult.colorSpace
                             )
-                            val bitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+                            bitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
                             hardwareBitmap?.recycle()
-                            screenshotResult.hardwareBuffer.close()
                             Log.d(TAG, "Screenshot captured successfully")
-                            if (continuation.isActive) continuation.resume(bitmap)
                         } catch (e: Exception) {
                             Log.e(TAG, "Screenshot conversion failed", e)
-                            if (continuation.isActive) continuation.resume(null)
+                            bitmap?.recycle()
+                            bitmap = null
+                        } finally {
+                            screenshotResult.hardwareBuffer.close()
                         }
+                        // A cancelled scan never receives the bitmap, so free it here.
+                        if (continuation.isActive) continuation.resume(bitmap) else bitmap?.recycle()
                     }
 
                     override fun onFailure(errorCode: Int) {
@@ -1042,16 +1063,17 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
 
     private fun findRootForPackage(targetPkg: String): AccessibilityNodeInfo? {
         val activeRoot = rootInActiveWindow
-        if (activeRoot != null && activeRoot.packageName?.toString() == targetPkg) return activeRoot
+        if (activeRoot?.packageName?.toString() == targetPkg) return activeRoot
 
-        val currentWindows = windows ?: return activeRoot
+        val currentWindows = windows ?: return null
         for (window in currentWindows) {
             val windowRoot = window.root ?: continue
             if (windowRoot.packageName?.toString() == targetPkg) {
                 return windowRoot
             }
         }
-        return activeRoot
+        // Never fall back to another app's window: it would be scanned and blocked as targetPkg.
+        return null
     }
 
     private fun extractText(node: AccessibilityNodeInfo, textList: MutableList<String>, depth: Int, maxNodes: Int = 60) {
