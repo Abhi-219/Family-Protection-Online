@@ -126,7 +126,23 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// Vivo component names differ across Funtouch/OriginOS versions; first one that launches wins.
+// Menu wording per OEM skin; falls back to stock Android wording.
+fun backgroundSurvivalTip(context: Context): String {
+    val steps = when (Build.MANUFACTURER.lowercase(Locale.ROOT)) {
+        "vivo", "iqoo" -> "allow Autostart and set Background power to 'Allow high background power consumption'"
+        "xiaomi", "redmi", "poco" -> "enable Autostart and set Battery saver to 'No restrictions'"
+        "oppo", "realme" -> "allow Auto launch and set Battery usage to 'Allow background activity'"
+        "oneplus" -> "set Battery optimization to 'Don't optimize' and allow Auto launch"
+        "samsung" -> "set Battery to 'Unrestricted' and remove the app from 'Sleeping apps'"
+        "huawei", "honor" -> "in App launch, turn off 'Manage automatically' and allow all three options"
+        else -> "set Battery to 'Unrestricted' / 'Don't optimize'"
+    }
+    // Without Device Owner, swiping the Recents card on many OEM skins force-stops the app and its services.
+    val recents = if (FamilyDeviceAdminReceiver.isDeviceOwner(context)) "" else ", and lock the app in Recents"
+    return "💡 To keep the guard running: $steps$recents."
+}
+
+// OEM component names change between skin versions; the first one that launches wins.
 fun openBackgroundSurvivalSettings(context: Context) {
     val pm = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
     val candidates = mutableListOf<Intent>()
@@ -136,9 +152,33 @@ fun openBackgroundSurvivalSettings(context: Context) {
             .setData(android.net.Uri.parse("package:${context.packageName}"))
         candidates += request
     }
-    candidates += Intent().setClassName("com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity")
-    candidates += Intent().setClassName("com.iqoo.secure", "com.iqoo.secure.ui.phoneoptimize.BgStartUpManager")
-    candidates += Intent().setClassName("com.iqoo.secure", "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity")
+    val oemComponents = when (Build.MANUFACTURER.lowercase(Locale.ROOT)) {
+        "vivo", "iqoo" -> listOf(
+            "com.vivo.permissionmanager" to "com.vivo.permissionmanager.activity.BgStartUpManagerActivity",
+            "com.iqoo.secure" to "com.iqoo.secure.ui.phoneoptimize.BgStartUpManager",
+            "com.iqoo.secure" to "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity"
+        )
+        "xiaomi", "redmi", "poco" -> listOf(
+            "com.miui.securitycenter" to "com.miui.permcenter.autostart.AutoStartManagementActivity"
+        )
+        "oppo", "realme" -> listOf(
+            "com.coloros.safecenter" to "com.coloros.safecenter.permission.startup.StartupAppListActivity",
+            "com.coloros.safecenter" to "com.coloros.safecenter.startupapp.StartupAppListActivity",
+            "com.oppo.safe" to "com.oppo.safe.permission.startup.StartupAppListActivity"
+        )
+        "oneplus" -> listOf(
+            "com.oneplus.security" to "com.oneplus.security.chainlaunch.view.ChainLaunchAppListActivity"
+        )
+        "samsung" -> listOf(
+            "com.samsung.android.lool" to "com.samsung.android.sm.battery.ui.BatteryActivity"
+        )
+        "huawei", "honor" -> listOf(
+            "com.huawei.systemmanager" to "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity",
+            "com.huawei.systemmanager" to "com.huawei.systemmanager.optimize.process.ProtectActivity"
+        )
+        else -> emptyList()
+    }
+    oemComponents.forEach { (pkg, cls) -> candidates += Intent().setClassName(pkg, cls) }
     candidates += Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
         .setData(android.net.Uri.parse("package:${context.packageName}"))
 
@@ -662,7 +702,6 @@ fun DnsControlScreen(isForeground: Boolean = true) {
             while (true) {
                 val now = System.currentTimeMillis()
                 currentTimeMillis = now
-                hasBankingUsageAccess = BankingAccessibilityPause.hasUsageAccess(context)
                 val bankingUntil = DnsPreferences.getBankingPauseUntil(context)
                 val bankingCooldown = DnsPreferences.getBankingPauseCooldownUntil(context)
                 isBankingPaused = now < bankingUntil && !isAccessibilityEnabled
@@ -670,10 +709,15 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                 isOnBankingCooldown = now < bankingCooldown
                 bankingCooldownRemainingSec = maxOf(0L, (bankingCooldown - now) / 1000L)
 
-                if (currentTimeMillis >= expiryMillis && expiryMillis > 0L) {
+                if (expiryMillis in 1L..currentTimeMillis) {
+                    // Reset so the expiry teardown runs once, not on every tick.
+                    expiryMillis = 0L
                     isActive = false
                     hasPasswordActive = false
-                    DnsForegroundService.stop(context)
+                    // The service may still be running a banking-pause monitor.
+                    if (BankingAccessibilityPause.automaticBankingPackage(context) == null) {
+                        DnsForegroundService.stop(context)
+                    }
                     VigilanceWatchdogAlarm.cancel(context)
                     WatchdogScheduler.cancel(context)
                 }
@@ -696,9 +740,13 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                 val accessibility = withContext(Dispatchers.IO) {
                     AntiUninstallAccessibilityService.isEnabled(context)
                 }
+                val usageAccess = withContext(Dispatchers.IO) {
+                    BankingAccessibilityPause.hasUsageAccess(context)
+                }
                 isDeviceAdmin = admin
                 isDeviceOwner = owner
                 isAccessibilityEnabled = accessibility
+                hasBankingUsageAccess = usageAccess
                 delay(5000L)
             }
         }
@@ -1574,6 +1622,7 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                                         try { DnsPreferences.clearPassword(context) } catch (_: Exception) {}
                                         isActive = false
                                         hasPasswordActive = false
+                                        expiryMillis = 0L
                                         DnsPreferences.saveDnsState(context, dnsName, totalYears, totalDays, totalHours, totalMinutes, false, 0L)
                                         Toast.makeText(context, "Password verified! DNS lock unlocked. App uninstall remains blocked.", Toast.LENGTH_LONG).show()
                                     }
@@ -1883,7 +1932,7 @@ fun DnsControlScreen(isForeground: Boolean = true) {
             title = { Text("🛡️ How to Enable Guard") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Because this is an APK, Android (especially Vivo) requires an extra step to enable security features:")
+                    Text("Because this is an APK, Android (especially Vivo, Xiaomi, Oppo, Realme and Samsung) requires an extra step to enable security features:")
 
                     Text("1. Exit this app and long-press the 'Family' icon.", fontSize = 13.sp)
                     Text("2. Tap 'App Info' (the 'i' icon).", fontSize = 13.sp)
@@ -1892,7 +1941,7 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                     Text("5. Now return here and click 'Open Settings' to enable the Guard service.", fontSize = 13.sp)
 
                     Spacer(modifier = Modifier.height(4.dp))
-                    Text("💡 Vivo: allow Autostart, set Background power to 'Allow high background power consumption', and lock the app in Recents (swipe down on its card).", fontSize = 12.sp, color = Color.Gray)
+                    Text(backgroundSurvivalTip(context), fontSize = 12.sp, color = Color.Gray)
                     OutlinedButton(
                         onClick = { openBackgroundSurvivalSettings(context) },
                         modifier = Modifier.fillMaxWidth()
