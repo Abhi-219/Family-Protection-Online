@@ -73,9 +73,9 @@ dependencies {
 
     // AI/ML dependencies for content detection (Unbundled Play Services versions for minimal APK size)
     implementation("com.google.android.gms:play-services-mlkit-image-labeling:16.0.8")
-    implementation("com.google.android.gms:play-services-mlkit-text-recognition:19.0.1")
     implementation("com.google.mlkit:vision-common:17.3.0")
     implementation("com.google.android.gms:play-services-tflite-java:16.4.0")
+    implementation("com.google.android.gms:play-services-tflite-gpu:16.4.0")
     
     // WorkManager for battery-efficient background tasks
     implementation("androidx.work:work-runtime-ktx:2.9.0")
