@@ -10,6 +10,7 @@ import android.database.ContentObserver
 import android.net.Uri
 import android.graphics.Bitmap
 import android.graphics.Rect
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -130,13 +131,15 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
 
         private const val CONFIRM_DELAY_MS = 700L
         private const val AGGRESSIVE_REARM_CONFIDENCE = 0.95f
+        private const val SCROLL_SETTLE_MS = 1_000L
+        private const val POWER_STATE_CACHE_MS = 30_000L
+        private const val LOW_BATTERY_PERCENT = 15
+        private const val POWER_SAVE_AI_FACTOR = 3L
 
         private val RELEVANT_EVENT_TYPES =
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
                 AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
                 AccessibilityEvent.TYPE_VIEW_SCROLLED or
-                AccessibilityEvent.TYPE_VIEW_CLICKED or
-                AccessibilityEvent.TYPE_VIEW_FOCUSED or
                 AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED or
                 AccessibilityEvent.TYPE_WINDOWS_CHANGED
         
@@ -165,7 +168,11 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
     private var scanWorkerJob: Job? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var stallRunnable: Runnable? = null
-    private var hasWarnedMissingUsageAccess = false
+    @Volatile private var hasWarnedMissingUsageAccess = false
+    private val bankingHandlingInProgress = AtomicBoolean(false)
+    private var scrollSettleJob: Job? = null
+    @Volatile private var powerFactor = 1L
+    @Volatile private var powerFactorCheckedAt = 0L
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -225,10 +232,9 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         val allSocialMedia = AppListPreferences.getAllSocialMediaApps(context)
         val supervisedPatterns = AppListPreferences.getAllSupervisedPatterns(context)
 
+        // Priority: own app > Blocked > Supervised > system/whitelist > browsers/social.
         val packageClass = when {
-            pkgName.contains("launcher", ignoreCase = true) ||
-                pkgName.contains("systemui", ignoreCase = true) ||
-                pkgName.contains("com.abhi.familyprotection") -> PackageClass.WHITELISTED
+            pkgName.contains("com.abhi.familyprotection") -> PackageClass.WHITELISTED
 
             allBlockedAdult.any { pattern ->
                 AppListPreferences.matchesPattern(pkgName, pattern)
@@ -238,10 +244,14 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
                 AppListPreferences.matchesPattern(pkgName, pattern)
             } -> PackageClass.RISKY
 
+            pkgName.contains("launcher", ignoreCase = true) ||
+                pkgName.contains("systemui", ignoreCase = true) -> PackageClass.WHITELISTED
+
             whitelistPackages.any { pkgName.contains(it, ignoreCase = true) } -> PackageClass.WHITELISTED
 
             browserApps.any { pkgName.contains(it, ignoreCase = true) } ||
-                allSocialMedia.any { pattern -> AppListPreferences.matchesPattern(pkgName, pattern) } -> PackageClass.RISKY
+                allSocialMedia.any { pattern -> AppListPreferences.matchesPattern(pkgName, pattern) } ||
+                AppListPreferences.isWebBrowser(context, pkgName) -> PackageClass.RISKY
 
             else -> PackageClass.NORMAL
         }
@@ -262,12 +272,28 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         else -> NORMAL_AI_COOLDOWN
     }
 
+    // Slows only screenshot/AI scans; keyword, block-list and tamper checks stay at full speed.
+    private fun aiPowerFactor(): Long {
+        val now = SystemClock.elapsedRealtime()
+        if (now - powerFactorCheckedAt < POWER_STATE_CACHE_MS) return powerFactor
+        powerFactorCheckedAt = now
+        val pm = powerManager
+        val battery = getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+        val level = battery?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: 100
+        val lowBattery = battery != null && !battery.isCharging && level in 1..LOW_BATTERY_PERCENT
+        val hot = pm != null && pm.currentThermalStatus >= PowerManager.THERMAL_STATUS_MODERATE
+        powerFactor = if (pm?.isPowerSaveMode == true || hot || lowBattery) POWER_SAVE_AI_FACTOR else 1L
+        return powerFactor
+    }
+
     private fun isSystemSettingsUi(pkgName: String): Boolean =
         pkgName.contains("settings", ignoreCase = true) ||
             pkgName.contains("packageinstaller", ignoreCase = true) ||
             pkgName.contains("permissioncontroller", ignoreCase = true) ||
             pkgName.contains("securitycenter", ignoreCase = true) ||
-            pkgName.contains("systemmanager", ignoreCase = true)
+            pkgName.contains("systemmanager", ignoreCase = true) ||
+            pkgName.contains("iqoo.secure", ignoreCase = true) ||
+            pkgName.contains("permissionmanager", ignoreCase = true)
 
     /** True when the foreground UI is the OS package-installer uninstall confirmation dialog. */
     private fun isPackageInstallerUi(pkgName: String): Boolean =
@@ -362,64 +388,14 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         }
 
         // Use the event source package directly; the active root can still be the launcher during launch.
-        val bankingForegroundPackage = pkgName.takeIf {
-            BankingAccessibilityPause.isBankingOrFinancialApp(applicationContext, it)
-        }
-        if (bankingForegroundPackage != null) {
-            val usageAccess = BankingAccessibilityPause.hasUsageAccess(applicationContext)
-            if (!usageAccess) {
-                Log.w(TAG, "Banking app detected but Usage Access is not granted; accessibility remains enabled")
-                logBankingDecision(
-                    "detected pkg=$bankingForegroundPackage usageAccess=false pauseStarted=false " +
-                        "serviceStartOk=false disableOk=false reason=usage_access_missing",
-                    "W"
-                )
-                if (!hasWarnedMissingUsageAccess) {
-                    Toast.makeText(
-                        applicationContext,
-                        "Enable Usage Access in Family Protection to use banking apps",
-                        Toast.LENGTH_LONG
-                    ).show()
-                    hasWarnedMissingUsageAccess = true
-                }
-                return
-            }
-            hasWarnedMissingUsageAccess = false
-            val pauseStarted =
-                BankingAccessibilityPause.startAutomaticPause(applicationContext, bankingForegroundPackage)
-            if (!pauseStarted) {
-                logBankingDecision(
-                    "detected pkg=$bankingForegroundPackage usageAccess=true pauseStarted=false " +
-                        "serviceStartOk=false disableOk=false reason=pause_persistence_failed",
-                    "E"
-                )
-                return
-            }
-
-            val serviceStartOk = DnsForegroundService.start(applicationContext)
-            if (!serviceStartOk) {
-                Log.e(TAG, "Cannot start the banking foreground monitor")
-                BankingAccessibilityPause.endAutomaticPause(applicationContext)
-                logBankingDecision(
-                    "detected pkg=$bankingForegroundPackage usageAccess=true pauseStarted=true " +
-                        "serviceStartOk=false disableOk=false reason=monitor_start_failed",
-                    "E"
-                )
-                return
-            }
-
-            val disableOk = BankingAccessibilityPause.disableServiceInSettings(applicationContext)
-            logBankingDecision(
-                "detected pkg=$bankingForegroundPackage usageAccess=true pauseStarted=true " +
-                    "serviceStartOk=true disableOk=$disableOk" +
-                    if (disableOk) "" else " reason=service_disable_failed",
-                if (disableOk) "I" else "E"
-            )
-            if (!disableOk) {
-                Log.e(TAG, "Could not pause accessibility for foreground banking app")
-                BankingAccessibilityPause.endAutomaticPause(applicationContext)
-                if (!DnsPreferences.isActive(applicationContext)) {
-                    DnsForegroundService.stop(applicationContext)
+        if (pkgName.trim().lowercase() in BankingAccessibilityPause.getBankingPackages(applicationContext)) {
+            if (bankingHandlingInProgress.compareAndSet(false, true)) {
+                serviceScope.launch {
+                    try {
+                        if (!handleBankingForeground(pkgName)) scanRequests.trySend(pkgName)
+                    } finally {
+                        bankingHandlingInProgress.set(false)
+                    }
                 }
             }
             return
@@ -428,14 +404,87 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
 
         // 2. Early Filter for Emergency Dialers & Whitelisted Packages
         if (isEmergencyDialer(pkgName)) return
-        val pkgClass = classify(pkgName)
-        if (pkgClass == PackageClass.WHITELISTED) return
+        // Cache-only on the main thread; uncached packages are classified by the background worker.
+        if (packageClasses[pkgName] == PackageClass.WHITELISTED) return
 
         // 3. Queue scan request
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
-            forceAiScanPackages.add(pkgName)
+            // Force the AI scan once the page settles, not on every scroll step.
+            scrollSettleJob?.cancel()
+            scrollSettleJob = serviceScope.launch {
+                delay(SCROLL_SETTLE_MS)
+                forceAiScanPackages.add(pkgName)
+                scanRequests.trySend(pkgName)
+            }
+            return
         }
         scanRequests.trySend(pkgName)
+    }
+
+    // Runs off the main thread: settings writes, usage-stats and package queries are binder calls.
+    private fun handleBankingForeground(bankingForegroundPackage: String): Boolean {
+        if (!BankingAccessibilityPause.isBankingOrFinancialApp(applicationContext, bankingForegroundPackage)) {
+            return false
+        }
+        val usageAccess = BankingAccessibilityPause.hasUsageAccess(applicationContext)
+        if (!usageAccess) {
+            Log.w(TAG, "Banking app detected but Usage Access is not granted; accessibility remains enabled")
+            logBankingDecision(
+                "detected pkg=$bankingForegroundPackage usageAccess=false pauseStarted=false " +
+                    "serviceStartOk=false disableOk=false reason=usage_access_missing",
+                "W"
+            )
+            if (!hasWarnedMissingUsageAccess) {
+                mainHandler.post {
+                    Toast.makeText(
+                        applicationContext,
+                        "Enable Usage Access in Family Protection to use banking apps",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                hasWarnedMissingUsageAccess = true
+            }
+            return true
+        }
+        hasWarnedMissingUsageAccess = false
+        val pauseStarted =
+            BankingAccessibilityPause.startAutomaticPause(applicationContext, bankingForegroundPackage)
+        if (!pauseStarted) {
+            logBankingDecision(
+                "detected pkg=$bankingForegroundPackage usageAccess=true pauseStarted=false " +
+                    "serviceStartOk=false disableOk=false reason=pause_persistence_failed",
+                "E"
+            )
+            return true
+        }
+
+        val serviceStartOk = DnsForegroundService.start(applicationContext)
+        if (!serviceStartOk) {
+            Log.e(TAG, "Cannot start the banking foreground monitor")
+            BankingAccessibilityPause.endAutomaticPause(applicationContext)
+            logBankingDecision(
+                "detected pkg=$bankingForegroundPackage usageAccess=true pauseStarted=true " +
+                    "serviceStartOk=false disableOk=false reason=monitor_start_failed",
+                "E"
+            )
+            return true
+        }
+
+        val disableOk = BankingAccessibilityPause.disableServiceInSettings(applicationContext)
+        logBankingDecision(
+            "detected pkg=$bankingForegroundPackage usageAccess=true pauseStarted=true " +
+                "serviceStartOk=true disableOk=$disableOk" +
+                if (disableOk) "" else " reason=service_disable_failed",
+            if (disableOk) "I" else "E"
+        )
+        if (!disableOk) {
+            Log.e(TAG, "Could not pause accessibility for foreground banking app")
+            BankingAccessibilityPause.endAutomaticPause(applicationContext)
+            if (!DnsPreferences.isActive(applicationContext)) {
+                DnsForegroundService.stop(applicationContext)
+            }
+        }
+        return true
     }
 
     private fun logBankingDecision(message: String, level: String) {
@@ -494,6 +543,19 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         }
 
         if (!isDnsLockActive) return
+
+        // Moving the clock forward would end the lock early, so the Date & time page is off-limits while locked.
+        if (isSystemSettingsUi(pkgName)) {
+            val rootNode = rootInActiveWindow
+            if (rootNode != null && isDateTimeSettingsScreen(rootNode)) {
+                Log.w(TAG, "BLOCKED: Date & time settings opened during lock - $pkgName")
+                AppLogger.log(context, "[CLOCK_TAMPER] pkg=$pkgName | action=2xBACK+HOME", TAG, "W")
+                VigilanceManager.recordViolation(context, "Date & time settings opened during lock")
+                dismissTamperingScreen()
+                return
+            }
+        }
+
         if (eventTime < DnsPreferences.getContentScanPauseUntil(context)) return
 
         val pkgClass = classify(pkgName)
@@ -558,7 +620,7 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         val elapsedSinceBlock = eventTime - scanState.lastBlockedTime
         val scanCooldown = getScanCooldown(elapsedSinceBlock)
         if (!forceAiScan && eventTime - scanState.lastScanTime < scanCooldown) return
-        if (forceAiScan && eventTime - scanState.lastAiScanTime < NORMAL_AI_COOLDOWN) return
+        if (forceAiScan && eventTime - scanState.lastAiScanTime < NORMAL_AI_COOLDOWN * aiPowerFactor()) return
         scanState.lastScanTime = eventTime
 
         if (pkgClass != PackageClass.RISKY) {
@@ -574,7 +636,7 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         } else {
             getAiCooldown(elapsedSinceBlock)
         }
-        if (eventTime - scanState.lastAiScanTime > aiCooldown &&
+        if (eventTime - scanState.lastAiScanTime > aiCooldown * aiPowerFactor() &&
             scanInProgress.compareAndSet(false, true)
         ) {
             scanState.lastAiScanTime = eventTime
@@ -607,12 +669,13 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
                         scanState.lastBlockedTime = System.currentTimeMillis()
                     }
 
-                    withContext(Dispatchers.Main) {
-                        if (DRY_RUN) {
-                            Log.w(TAG, "DRY RUN would block $pkgName - ${result.reason}")
-                        } else {
-                            Log.w(TAG, "BLOCKING content: $pkgName - ${result.reason}")
-                            blockCurrentApp(pkgName, result.reason)
+                    if (DRY_RUN) {
+                        Log.w(TAG, "DRY RUN would block $pkgName - ${result.reason}")
+                    } else {
+                        Log.w(TAG, "BLOCKING content: $pkgName - ${result.reason}")
+                        // Kept off Main: it resolves labels, writes prefs and sends SMS.
+                        blockCurrentApp(pkgName, result.reason)
+                        withContext(Dispatchers.Main) {
                             Toast.makeText(
                                 context,
                                 "⛔ BLOCKED: ${result.reason}\nConfidence: ${(result.confidence * 100).toInt()}%",
@@ -773,7 +836,8 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         try {
             takeScreenshot(
                 android.view.Display.DEFAULT_DISPLAY,
-                application.mainExecutor,
+                // Full-screen bitmap copy is ~10 MB; do it off the main thread.
+                Dispatchers.Default.asExecutor(),
                 object : TakeScreenshotCallback {
                     override fun onSuccess(screenshotResult: ScreenshotResult) {
                         try {
@@ -948,6 +1012,16 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         }
 
         return false
+    }
+
+    private fun isDateTimeSettingsScreen(rootNode: AccessibilityNodeInfo): Boolean {
+        val textList = mutableListOf<String>()
+        extractText(rootNode, textList, 0, 50)
+        val text = textList.joinToString(" ").lowercase()
+        val isDateTimePage = text.contains("date & time") || text.contains("date and time")
+        if (!isDateTimePage) return false
+        return text.contains("automatic") || text.contains("auto-set") || text.contains("set time") ||
+            text.contains("set date") || text.contains("network-provided") || text.contains("time zone")
     }
 
     private fun containsSwitchWidget(node: AccessibilityNodeInfo, depth: Int = 0): Boolean {
