@@ -2,17 +2,25 @@ package com.abhi.familyprotection
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Rect
 import android.util.Log
 import android.view.accessibility.AccessibilityNodeInfo
+import com.google.android.gms.tflite.client.TfLiteInitializationOptions
+import com.google.android.gms.tflite.gpu.support.TfLiteGpu
 import com.google.android.gms.tflite.java.TfLite
 import org.tensorflow.lite.InterpreterApi
+import org.tensorflow.lite.gpu.GpuDelegateFactory
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.label.ImageLabeling
 import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -44,8 +52,11 @@ class SmartContentDetector(private val context: Context) {
             .setConfidenceThreshold(0.75f)
             .build()
     )
-    private val textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private var nsfwInterpreter: InterpreterApi? = null
+    private var gpuAvailable: Boolean? = null
+    private var gpuDisabled = false
+    private val idleScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var idleCloseJob: Job? = null
     private val benignContentCache = ConcurrentHashMap<String, BenignContentCache>()
 
     // Reused across passes; callers must serialise analyzeContent (the service does).
@@ -89,7 +100,7 @@ class SmartContentDetector(private val context: Context) {
         private const val VERBOSE_LOGS = false
 
         private const val NSFW_INPUT_SIZE = 224
-        private const val IMAGE_MAX_DIM = 640       // labeling/NSFW input; OCR keeps native resolution
+        private const val IMAGE_MAX_DIM = 640       // labeling/NSFW input
 
         // ---- Tunable thresholds (loosened) ----
         private const val TEXT_ONLY_BLOCK = 1.0f      // needs several terms stacking
@@ -98,7 +109,12 @@ class SmartContentDetector(private val context: Context) {
         private const val COMBINED_IMAGE_MIN = 0.6f
         private const val IMAGE_SKIP_TEXT = 1.0f      // skip image analysis if text already decisive
         private const val LABEL_MIN_CONFIDENCE = 0.9f
-        private const val OCR_TOP_SKIP = 0.10f        // ignore top 10% of screenshot
+        private const val LABELER_SKIP_BELOW = 0.15f  // NSFW model confidently safe -> skip ML Kit labeler
+        private const val INTERPRETER_IDLE_CLOSE_MS = 3 * 60 * 1000L
+        private const val MEDIA_SCAN_MAX_NODES = 400
+        private const val MIN_NODES_FOR_TRUST = 8
+        private const val MEDIA_MIN_SIDE_FRACTION = 0.2f
+        private val MEDIA_CLASS_HINTS = listOf("Image", "Video", "Surface", "Texture", "Player")
         private const val REPEAT_BONUS = 0.0f         // 0 = repeated words don't inflate the score
         private const val REPEAT_BONUS_MAX_STEPS = 4
         private const val SUGGESTION_FACTOR = 0.3f    // autocomplete rows count only 30%
@@ -291,7 +307,11 @@ class SmartContentDetector(private val context: Context) {
                 if (assessment.effectiveTextScore >= IMAGE_SKIP_TEXT) {
                     0f
                 } else {
-                    screenshot = if (!suggestionsVisible) screenshotProvider?.invoke() else null
+                    screenshot = if (!suggestionsVisible && (rootNode == null || hasVisualMedia(rootNode))) {
+                        screenshotProvider?.invoke()
+                    } else {
+                        null
+                    }
                     screenshot?.let { analyzeImage(it) } ?: 0f
                 }
             } finally {
@@ -492,6 +512,10 @@ class SmartContentDetector(private val context: Context) {
             }
 
             val modelScore = analyzeWithNsfwModel(small)
+            // The labeler can only raise the score, so it only matters when the model is unsure.
+            if (modelScore >= IMAGE_ONLY_BLOCK || modelScore < LABELER_SKIP_BELOW) {
+                return@withContext modelScore
+            }
             var labelScore = 0f
 
             val labels = imageLabeler.process(InputImage.fromBitmap(small, 0)).await()
@@ -580,7 +604,18 @@ class SmartContentDetector(private val context: Context) {
         nsfwInput.rewind()
 
         val output = Array(1) { FloatArray(2) }
-        getNsfwInterpreter().run(nsfwInput, output)
+        try {
+            getNsfwInterpreter().run(nsfwInput, output)
+        } catch (e: Exception) {
+            if (gpuDisabled) throw e
+            Log.w(TAG, "NSFW inference failed on GPU; switching to CPU", e)
+            gpuDisabled = true
+            nsfwInterpreter?.close()
+            nsfwInterpreter = null
+            nsfwInput.rewind()
+            getNsfwInterpreter().run(nsfwInput, output)
+        }
+        scheduleInterpreterIdleClose()
         val score = output[0][1].coerceIn(0f, 1f)
         if (VERBOSE_LOGS) Log.d(TAG, "TFLite NSFW score: $score")
         score
@@ -597,32 +632,69 @@ class SmartContentDetector(private val context: Context) {
         }
     }
 
+    // Caller must hold tfliteMutex.
     private suspend fun getNsfwInterpreter(): InterpreterApi {
-        return nsfwInterpreter ?: run {
-            TfLite.initialize(context).await()
-            InterpreterApi.create(
-                loadModelFile("nsfw.tflite"),
-                InterpreterApi.Options()
-                    .setNumThreads(2)
-                    .setRuntime(InterpreterApi.Options.TfLiteRuntime.FROM_SYSTEM_ONLY)
-            ).also { nsfwInterpreter = it }
+        nsfwInterpreter?.let { return it }
+        val gpu = gpuAvailable ?: (try {
+            TfLiteGpu.isGpuDelegateAvailable(context).await()
+        } catch (_: Exception) {
+            false
+        }).also { gpuAvailable = it }
+        TfLite.initialize(
+            context,
+            TfLiteInitializationOptions.builder().setEnableGpuDelegateSupport(gpu).build()
+        ).await()
+
+        val model = loadModelFile("nsfw.tflite")
+        val gpuInterpreter = if (gpu && !gpuDisabled) {
+            try {
+                InterpreterApi.create(model, baseInterpreterOptions().addDelegateFactory(GpuDelegateFactory()))
+            } catch (e: Exception) {
+                Log.w(TAG, "GPU delegate rejected the NSFW model; using CPU", e)
+                gpuDisabled = true
+                null
+            }
+        } else {
+            null
+        }
+        return (gpuInterpreter ?: InterpreterApi.create(model, baseInterpreterOptions()))
+            .also { nsfwInterpreter = it }
+    }
+
+    private fun baseInterpreterOptions() = InterpreterApi.Options()
+        .setNumThreads(2)
+        .setRuntime(InterpreterApi.Options.TfLiteRuntime.FROM_SYSTEM_ONLY)
+
+    // Frees the model (and GPU resources) when browsing stops; it reloads on the next image.
+    private fun scheduleInterpreterIdleClose() {
+        idleCloseJob?.cancel()
+        idleCloseJob = idleScope.launch {
+            delay(INTERPRETER_IDLE_CLOSE_MS)
+            tfliteMutex.withLock {
+                nsfwInterpreter?.close()
+                nsfwInterpreter = null
+            }
         }
     }
 
-    /** OCR on the screenshot, skipping the top strip (address bar / search box). */
-    private suspend fun extractImageText(bitmap: Bitmap): String = withContext(Dispatchers.Default) {
-        var target: Bitmap? = null
-        try {
-            val top = (bitmap.height * OCR_TOP_SKIP).toInt()
-            val height = bitmap.height - top
-            target = if (height > 0) Bitmap.createBitmap(bitmap, 0, top, bitmap.width, height) else bitmap
-            textRecognizer.process(InputImage.fromBitmap(target, 0)).await().text
-        } catch (e: Exception) {
-            Log.e(TAG, "Screenshot text recognition failed", e)
-            ""
-        } finally {
-            target?.let { if (it !== bitmap) it.recycle() }
+    // Screens with no sizeable image/video node have nothing for the image model to find.
+    private fun hasVisualMedia(root: AccessibilityNodeInfo): Boolean {
+        val minSide = (context.resources.displayMetrics.widthPixels * MEDIA_MIN_SIDE_FRACTION).toInt()
+        val rect = Rect()
+        val stack = ArrayDeque<AccessibilityNodeInfo>().apply { addLast(root) }
+        var visited = 0
+        while (stack.isNotEmpty() && visited < MEDIA_SCAN_MAX_NODES) {
+            val node = stack.removeLast()
+            visited++
+            val cls = node.className?.toString().orEmpty()
+            if (MEDIA_CLASS_HINTS.any { cls.contains(it, ignoreCase = true) }) {
+                node.getBoundsInScreen(rect)
+                if (rect.width() >= minSide && rect.height() >= minSide) return true
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let(stack::addLast)
         }
+        // Too few nodes (Flutter/canvas UIs) or tree too large to finish: can't rule media out.
+        return visited < MIN_NODES_FOR_TRUST || stack.isNotEmpty()
     }
 
     /** Collects accessibility text, split into URL/query, autocomplete suggestions, and page text. */
@@ -679,9 +751,9 @@ class SmartContentDetector(private val context: Context) {
     }
 
     fun cleanup() {
+        idleScope.cancel()
         benignContentCache.clear()
         imageLabeler.close()
-        textRecognizer.close()
         nsfwInterpreter?.close()
         nsfwInterpreter = null
     }
