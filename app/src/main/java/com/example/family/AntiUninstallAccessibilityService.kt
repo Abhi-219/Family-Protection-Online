@@ -36,7 +36,8 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         @Volatile var lastAiScanTime: Long = 0L,
         @Volatile var lastBlockedTime: Long = 0L,
         @Volatile var lastContentHash: Int? = null,
-        @Volatile var lastContentWasBenign: Boolean = false
+        @Volatile var lastContentWasBenign: Boolean = false,
+        @Volatile var lastKeywordCheckTime: Long = 0L
     )
 
     private enum class PackageClass { WHITELISTED, BLOCKED_ADULT, RISKY, NORMAL }
@@ -85,6 +86,11 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
     // Matches the real package ID, the full app label, or just "Family" (word-bounded),
     // but NOT phrases like "managed by family" used by MDM solutions.
     private val familyRegex = Regex("(?<!managed by\\s)(family protection|com\\.abhi\\.familyprotection|\\bfamily\\b)", setOf(RegexOption.IGNORE_CASE))
+    // Other products named "Family …" (Google Family Link, Apple/Microsoft family pages) must not count as us.
+    private val familyLookalikeRegex = Regex(
+        "\\bfamily\\s+(link|sharing|group|library|safety|members?|plan|center|centre|space)\\b",
+        RegexOption.IGNORE_CASE
+    )
     
     // Browsers and social media where AI detection is needed
     private val browserApps = setOf(
@@ -135,6 +141,7 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         private const val CONFIRM_DELAY_MS = 700L
         private const val AGGRESSIVE_REARM_CONFIDENCE = 0.95f
         private const val SCROLL_SETTLE_MS = 1_000L
+        private const val KEYWORD_CHECK_INTERVAL_MS = 1_000L
         private const val POWER_STATE_CACHE_MS = 30_000L
         private const val LOW_BATTERY_PERCENT = 15
         private const val POWER_SAVE_AI_FACTOR = 3L
@@ -174,6 +181,7 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
     @Volatile private var hasWarnedMissingUsageAccess = false
     private val bankingHandlingInProgress = AtomicBoolean(false)
     private var scrollSettleJob: Job? = null
+    private val pendingKeywordRechecks = ConcurrentHashMap.newKeySet<String>()
     @Volatile private var powerFactor = 1L
     @Volatile private var powerFactorCheckedAt = 0L
 
@@ -283,6 +291,12 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
             adminStateCheckedAt = now
         }
         return cachedIsDeviceAdmin to cachedIsDeviceOwner
+    }
+
+    // Same condition processEvent uses for the launcher drag-to-uninstall check.
+    private fun needsLauncherTamperCheck(): Boolean {
+        val (isAdmin, isOwner) = refreshAdminState()
+        return isAdmin && !isOwner
     }
 
     // Slows only screenshot/AI scans; keyword, block-list and tamper checks stay at full speed.
@@ -424,7 +438,10 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         // 2. Early Filter for Emergency Dialers & Whitelisted Packages
         if (isEmergencyDialer(pkgName)) return
         // Cache-only on the main thread; uncached packages are classified by the background worker.
-        if (packageClasses[pkgName] == PackageClass.WHITELISTED) return
+        // Launchers stay whitelisted for content, but drag-to-uninstall must be checked on every launcher event.
+        if (packageClasses[pkgName] == PackageClass.WHITELISTED &&
+            !(isLauncherUi(pkgName) && needsLauncherTamperCheck())
+        ) return
 
         // 3. Queue scan request
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
@@ -579,27 +596,35 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         val pkgClass = classify(pkgName)
         if (pkgClass == PackageClass.WHITELISTED) return
 
-        var currentScreenHash: Int? = null
+        val scanState = appScanStates.getOrPut(pkgName) { AppScanState() }
+        val elapsedSinceBlock = eventTime - scanState.lastBlockedTime
+        // Shortest possible AI cooldown; if even that hasn't passed, no AI scan can run this pass.
+        val aiMaybeDue = pkgClass == PackageClass.RISKY && !scanInProgress.get() &&
+            (forceAiScan || eventTime - scanState.lastScanTime >= getScanCooldown(elapsedSinceBlock)) &&
+            eventTime - scanState.lastAiScanTime > getAiCooldown(elapsedSinceBlock) * aiPowerFactor()
+
+        var screenSnapshot: SmartContentDetector.ScreenText? = null
         if (pkgClass == PackageClass.RISKY) {
-            val rootNode = findRootForPackage(pkgName)
+            val sinceKeywordCheck = eventTime - scanState.lastKeywordCheckTime
+            val rootNode = if (!aiMaybeDue && sinceKeywordCheck < KEYWORD_CHECK_INTERVAL_MS) {
+                // Feeds and loading pages fire constantly; a trailing recheck still covers the settled screen.
+                scheduleKeywordRecheck(pkgName, KEYWORD_CHECK_INTERVAL_MS - sinceKeywordCheck)
+                null
+            } else {
+                findRootForPackage(pkgName)
+            }
             if (rootNode != null) {
-                val screenData = extractScreenData(rootNode, maxNodes = 120)
-                currentScreenHash = screenData.contentHash
-                val matchedKeyword = KeywordPreferences.findHardKeyword(
-                    context,
-                    screenData.visibleText.joinToString(" ")
-                )
+                scanState.lastKeywordCheckTime = eventTime
+                // One read per pass: the full snapshot doubles as keyword input when the AI scan may follow.
+                val keywordText = if (aiMaybeDue) {
+                    smartDetector.readScreen(rootNode).also { screenSnapshot = it }.keywordText
+                } else {
+                    extractVisibleText(rootNode, maxNodes = 120).joinToString(" ")
+                }
+                val matchedKeyword = KeywordPreferences.findHardKeyword(context, keywordText)
                 if (matchedKeyword != null) {
-                    val appName = SmsSender.resolveAppName(context, pkgName)
-                    AppLogger.log(
-                        context,
-                        "[KEYWORD_BLOCK] app=$appName | pkg=$pkgName | keyword=\"$matchedKeyword\" | action=LOCK | timedLockout=false",
-                        TAG,
-                        "E"
-                    )
-                    pipDismissTargets[pkgName] = eventTime + 60_000L
-                    Log.w(TAG, "Keyword block: app=$appName pkg=$pkgName keyword=\"$matchedKeyword\"")
-                    lockDeviceScreen()
+                    Log.w(TAG, "Keyword block: pkg=$pkgName keyword=\"$matchedKeyword\"")
+                    blockCurrentApp(pkgName, "Keyword: $matchedKeyword")
                     return
                 }
             }
@@ -634,8 +659,6 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
             }
         }
 
-        val scanState = appScanStates.getOrPut(pkgName) { AppScanState() }
-        val elapsedSinceBlock = eventTime - scanState.lastBlockedTime
         val scanCooldown = getScanCooldown(elapsedSinceBlock)
         if (!forceAiScan && eventTime - scanState.lastScanTime < scanCooldown) return
         if (forceAiScan && eventTime - scanState.lastAiScanTime < NORMAL_AI_COOLDOWN * aiPowerFactor()) return
@@ -646,8 +669,9 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
             return
         }
 
+        val snapshot = screenSnapshot ?: return
         val currentRoot = findRootForPackage(pkgName) ?: return
-        val contentHash = currentScreenHash ?: extractScreenData(currentRoot, maxNodes = 120).contentHash
+        val contentHash = snapshot.contentHash
         val contentChanged = scanState.lastContentHash != contentHash
         val aiCooldown = if (!contentChanged && scanState.lastContentWasBenign && !forceAiScan) {
             UNCHANGED_BENIGN_AI_COOLDOWN
@@ -664,7 +688,7 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
                     if (findRootForPackage(pkgName) != null) captureScreenshot() else null
                 }
 
-                val result = smartDetector.analyzeContent(pkgName, currentRoot, capture, forceAiScan)
+                val result = smartDetector.analyzeContent(pkgName, currentRoot, capture, forceAiScan, snapshot)
                 scanState.lastContentHash = contentHash
                 scanState.lastContentWasBenign = !result.isBlocked && result.method != "error"
                     if (!result.isBlocked) {
@@ -709,6 +733,15 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
             }
         }
 
+    private fun scheduleKeywordRecheck(pkgName: String, delayMs: Long) {
+        if (!pendingKeywordRechecks.add(pkgName)) return
+        serviceScope.launch {
+            delay(delayMs)
+            pendingKeywordRechecks.remove(pkgName)
+            scanRequests.trySend(pkgName)
+        }
+    }
+
     private fun blockCurrentApp(pkgName: String, reason: String) {
         if (pkgName == applicationContext.packageName || pkgName.contains("launcher", ignoreCase = true) || isEmergencyDialer(pkgName)) return
         val lockoutUntil = System.currentTimeMillis() + LOCKOUT_DURATION_MS
@@ -726,11 +759,13 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         Handler(Looper.getMainLooper()).post {
             Toast.makeText(applicationContext, "⛔ Blocked ($reason)", Toast.LENGTH_LONG).show()
         }
-        SmsSender.sendBlockedAppAlert(applicationContext, appName, pkgName)
+        // Sent only here, after confirmation, so unconfirmed candidates never alert or burn the SMS cooldown.
+        SmsSender.sendKeywordAlert(applicationContext, appName, pkgName, reason)
         Log.w(TAG, "Screen locked due to content violation, reason=$reason, app locked for 5m: $pkgName")
         Handler(Looper.getMainLooper()).postDelayed({
             dismissLockedPictureInPicture(force = true)
         }, 400L)
+        // Must start after lockDeviceScreen's back/home/lock sequence (~360 ms) finishes.
         Handler(Looper.getMainLooper()).postDelayed({
             val foregroundPackage = rootInActiveWindow?.packageName?.toString()
             if (foregroundPackage == pkgName || (foregroundPackage != null &&
@@ -738,7 +773,7 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
                 Log.w(TAG, "Foreground still blocked app: $foregroundPackage; retrying Lock")
                 lockDeviceScreen()
             }
-        }, 250L)
+        }, 600L)
     }
 
     private fun dismissLockedPictureInPicture(force: Boolean = false) {
@@ -860,19 +895,20 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
                 object : TakeScreenshotCallback {
                     override fun onSuccess(screenshotResult: ScreenshotResult) {
                         var bitmap: Bitmap? = null
+                        var hardwareBitmap: Bitmap? = null
                         try {
-                            val hardwareBitmap = Bitmap.wrapHardwareBuffer(
+                            hardwareBitmap = Bitmap.wrapHardwareBuffer(
                                 screenshotResult.hardwareBuffer,
                                 screenshotResult.colorSpace
                             )
                             bitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
-                            hardwareBitmap?.recycle()
                             Log.d(TAG, "Screenshot captured successfully")
                         } catch (e: Exception) {
                             Log.e(TAG, "Screenshot conversion failed", e)
                             bitmap?.recycle()
                             bitmap = null
                         } finally {
+                            hardwareBitmap?.recycle()
                             screenshotResult.hardwareBuffer.close()
                         }
                         // onCancellation frees the bitmap if the scan is cancelled before it is delivered.
@@ -985,10 +1021,17 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
     private fun isSettingsTargetingOurApp(rootNode: AccessibilityNodeInfo): Boolean {
         val textList = mutableListOf<String>()
         extractText(rootNode, textList, 0, 50)
-        val combinedText = textList.joinToString(" ").lowercase()
+        val combinedText = familyLookalikeRegex.replace(textList.joinToString(" ").lowercase(), " ")
 
         // If our app name or package is not present at all on screen, it is not targeting us.
         if (!familyRegex.containsMatchIn(combinedText)) return false
+
+        // Title/header is our app, i.e. our own App Info or battery detail page rather than a list of apps.
+        val firstFewTexts = familyLookalikeRegex.replace(textList.take(5).joinToString(" ").lowercase(), " ")
+        val isTitleOurApp = familyRegex.containsMatchIn(firstFewTexts) &&
+            !firstFewTexts.contains("downloaded") &&
+            !firstFewTexts.contains("installed") &&
+            !firstFewTexts.contains("accessibility")
 
         // 1. Direct destructive actions on our App Info page in Settings
         val hasDestructiveAction = combinedText.contains("force stop") ||
@@ -1001,8 +1044,8 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
 
         if (hasDestructiveAction) return true
 
-        // 1.1 Battery optimization / restriction tampering
-        val hasBatteryTampering = combinedText.contains("battery") &&
+        // 1.1 Battery restriction, only on our own page so the overall Battery usage list stays usable.
+        val hasBatteryTampering = isTitleOurApp && combinedText.contains("battery") &&
             (combinedText.contains("restricted") ||
              combinedText.contains("restrict") ||
              combinedText.contains("optimize") ||
@@ -1029,11 +1072,6 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
 
         // 3. Screen title / top header is specifically our app AND the page contains an interactive switch/toggle
         // (Handles customized vendor ROMs like Xiaomi/MIUI, Vivo, Oppo, Samsung that might use different toggle labels)
-        val firstFewTexts = textList.take(5).joinToString(" ").lowercase()
-        val isTitleOurApp = familyRegex.containsMatchIn(firstFewTexts) &&
-            !firstFewTexts.contains("downloaded") &&
-            !firstFewTexts.contains("installed") &&
-            !firstFewTexts.contains("accessibility")
         if (isTitleOurApp && containsSwitchWidget(rootNode)) {
             return true
         }
@@ -1082,28 +1120,36 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         return null
     }
 
-    private fun extractText(node: AccessibilityNodeInfo, textList: MutableList<String>, depth: Int, maxNodes: Int = 60) {
+    private fun extractText(
+        node: AccessibilityNodeInfo,
+        textList: MutableList<String>,
+        depth: Int,
+        maxNodes: Int = 60,
+        skipSuggestions: Boolean = false
+    ) {
         if (textList.size >= maxNodes || depth > 5) return
-        
-        node.text?.toString()?.let { if (it.isNotBlank()) textList.add(it) }
-        node.contentDescription?.toString()?.let { if (it.isNotBlank()) textList.add(it) }
+
+        // Same precedence as the detector: URL bar and editable fields count as the query, never as suggestions.
+        val isSuggestion = skipSuggestions && !node.isEditable &&
+            node.viewIdResourceName?.lowercase()?.let { id ->
+                SmartContentDetector.URL_BAR_IDS.none { id.contains(it) } &&
+                    SmartContentDetector.SUGGESTION_IDS.any { id.contains(it) }
+            } == true
+        if (!isSuggestion) {
+            node.text?.toString()?.let { if (it.isNotBlank()) textList.add(it) }
+            node.contentDescription?.toString()?.let { if (it.isNotBlank()) textList.add(it) }
+        }
         
         for (i in 0 until node.childCount) {
             if (textList.size >= maxNodes) return
-            node.getChild(i)?.let { extractText(it, textList, depth + 1, maxNodes) }
+            node.getChild(i)?.let { extractText(it, textList, depth + 1, maxNodes, skipSuggestions) }
         }
     }
 
-    private data class ExtractedScreenData(
-        val visibleText: List<String>,
-        val contentHash: Int
-    )
-
-    private fun extractScreenData(rootNode: AccessibilityNodeInfo, maxNodes: Int = 120): ExtractedScreenData {
+    private fun extractVisibleText(rootNode: AccessibilityNodeInfo, maxNodes: Int = 120): List<String> {
         val visibleText = ArrayList<String>(maxNodes)
-        extractText(rootNode, visibleText, 0, maxNodes = maxNodes)
-        val contentHash = visibleText.joinToString("\u001F").hashCode()
-        return ExtractedScreenData(visibleText, contentHash)
+        extractText(rootNode, visibleText, 0, maxNodes = maxNodes, skipSuggestions = true)
+        return visibleText
     }
     
     private fun lockDeviceScreen() {
