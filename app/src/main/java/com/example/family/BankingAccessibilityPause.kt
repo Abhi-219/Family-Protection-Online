@@ -224,7 +224,8 @@ object BankingAccessibilityPause {
 
     private val protectedSystemMarkers = listOf(
         "settings", "packageinstaller", "permissioncontroller", "securitycenter", "systemmanager",
-        "iqoo.secure", "permissionmanager", "launcher", "systemui", "com.android.vending"
+        "iqoo.secure", "permissionmanager", "safecenter", "oneplus.security", "samsung.android.lool",
+        "samsung.android.sm", "launcher", "systemui", "com.android.vending"
     )
 
     // Priority: Blocked > Supervised > Banking. Anything blocked, supervised, monitored or system-critical can never pause accessibility.
