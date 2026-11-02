@@ -276,7 +276,8 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
     // Admin/owner status rarely changes; avoid a DevicePolicyManager binder call per event.
     private fun refreshAdminState(): Pair<Boolean, Boolean> {
         val now = SystemClock.elapsedRealtime()
-        if (now - adminStateCheckedAt >= ADMIN_STATE_CACHE_MS) {
+        // elapsedRealtime can be under 30s right after boot, so 0L must always mean "never checked".
+        if (adminStateCheckedAt == 0L || now - adminStateCheckedAt >= ADMIN_STATE_CACHE_MS) {
             cachedIsDeviceAdmin = FamilyDeviceAdminReceiver.isDeviceAdmin(applicationContext)
             cachedIsDeviceOwner = FamilyDeviceAdminReceiver.isDeviceOwner(applicationContext)
             adminStateCheckedAt = now
@@ -842,6 +843,7 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         AppLogger.log(applicationContext, "[PIP_DISMISS] pkg=$packageName | method=$method", TAG, "I")
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     private suspend fun captureScreenshot(): Bitmap? = suspendCancellableCoroutine { continuation ->
         if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) {
             Log.w(TAG, "Screenshot API not available (requires Android 11+)")
@@ -873,8 +875,12 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
                         } finally {
                             screenshotResult.hardwareBuffer.close()
                         }
-                        // A cancelled scan never receives the bitmap, so free it here.
-                        if (continuation.isActive) continuation.resume(bitmap) else bitmap?.recycle()
+                        // onCancellation frees the bitmap if the scan is cancelled before it is delivered.
+                        if (continuation.isActive) {
+                            continuation.resume(bitmap) { bitmap?.recycle() }
+                        } else {
+                            bitmap?.recycle()
+                        }
                     }
 
                     override fun onFailure(errorCode: Int) {
