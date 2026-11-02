@@ -34,10 +34,38 @@ object KeywordPreferences {
         "nude lipstick", "nude heels", "nude shade"
     )
 
-    private fun getPrefs(context: Context): SharedPreferences {
-        return context.createDeviceProtectedStorageContext()
-            .getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+    private class CompiledKeywords(
+        val exceptions: List<Regex>,
+        val keywords: List<Pair<String, Regex>>
+    )
+
+    @Volatile private var compiledCache: CompiledKeywords? = null
+
+    private fun getCompiled(context: Context): CompiledKeywords {
+        compiledCache?.let { return it }
+        return synchronized(this) {
+            compiledCache ?: CompiledKeywords(
+                exceptions = getAllExceptions(context).map { buildRegex(it, plural = false) },
+                keywords = getAllHardKeywords(context)
+                    .sortedByDescending { it.length }
+                    .map { it to buildRegex(it) }
+            ).also { compiledCache = it }
+        }
     }
+
+    fun clearCache() {
+        compiledCache = null
+    }
+
+    @Volatile private var cachedPrefs: SharedPreferences? = null
+
+    private fun getPrefs(context: Context): SharedPreferences =
+        cachedPrefs ?: synchronized(this) {
+            cachedPrefs ?: context.applicationContext
+                .createDeviceProtectedStorageContext()
+                .getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                .also { cachedPrefs = it }
+        }
 
     fun getCustomHardKeywords(context: Context): Set<String> {
         return getPrefs(context).getStringSet(KEY_CUSTOM_HARD_KEYWORDS, emptySet()) ?: emptySet()
@@ -49,12 +77,14 @@ object KeywordPreferences {
         val current = getCustomHardKeywords(context).toMutableSet()
         current.add(trimmed)
         getPrefs(context).edit().putStringSet(KEY_CUSTOM_HARD_KEYWORDS, current).apply()
+        clearCache()
     }
 
     fun removeHardKeyword(context: Context, keyword: String) {
         val current = getCustomHardKeywords(context).toMutableSet()
         if (current.remove(keyword.trim().lowercase())) {
             getPrefs(context).edit().putStringSet(KEY_CUSTOM_HARD_KEYWORDS, current).apply()
+            clearCache()
         }
     }
 
@@ -68,12 +98,14 @@ object KeywordPreferences {
         val current = getCustomExceptions(context).toMutableSet()
         current.add(trimmed)
         getPrefs(context).edit().putStringSet(KEY_CUSTOM_EXCEPTIONS, current).apply()
+        clearCache()
     }
 
     fun removeException(context: Context, phrase: String) {
         val current = getCustomExceptions(context).toMutableSet()
         if (current.remove(phrase.trim().lowercase())) {
             getPrefs(context).edit().putStringSet(KEY_CUSTOM_EXCEPTIONS, current).apply()
+            clearCache()
         }
     }
 
@@ -82,17 +114,13 @@ object KeywordPreferences {
     }
 
     fun findHardKeyword(context: Context, visibleText: String): String? {
-        var searchableText = visibleText
-        getAllExceptions(context).forEach { exception ->
-            searchableText = buildRegex(exception, plural = false)
-                .replace(searchableText, " ")
+        if (visibleText.isBlank()) return null
+        val c = getCompiled(context)
+        var text = visibleText
+        for (ex in c.exceptions) {
+            text = ex.replace(text, " ")
         }
-
-        return getAllHardKeywords(context)
-            .sortedByDescending { it.length }
-            .firstOrNull { keyword ->
-                buildRegex(keyword).containsMatchIn(searchableText)
-            }
+        return c.keywords.firstOrNull { (_, re) -> re.containsMatchIn(text) }?.first
     }
 
     fun getAllExceptions(context: Context): Set<String> {
@@ -108,22 +136,26 @@ object KeywordPreferences {
                 when (val c = trimmed[i]) {
                     '*' -> {
                         if (i + 1 < trimmed.length && trimmed[i + 1] == '*') {
-                            sb.append(".*") // ** matches across multiple words & spaces
+                            sb.append(".*?")
                             i++
                         } else {
-                            sb.append("[\\p{L}\\p{N}]*") // * matches alphanumeric characters within a single word
+                            sb.append("[^\\s]*?")
                         }
                     }
-                    ' ' -> sb.append("[\\s\\-]+")
                     else -> sb.append(Regex.escape(c.toString()))
                 }
                 i++
             }
             sb.append("(?![\\p{L}\\p{N}])")
             return Regex(sb.toString(), RegexOption.IGNORE_CASE)
+        } else {
+            val escaped = Regex.escape(trimmed)
+            val patternStr = if (plural && !trimmed.endsWith("s")) {
+                "(?<![\\p{L}\\p{N}])$escaped(?:s|es)?(?![\\p{L}\\p{N}])"
+            } else {
+                "(?<![\\p{L}\\p{N}])$escaped(?![\\p{L}\\p{N}])"
+            }
+            return Regex(patternStr, RegexOption.IGNORE_CASE)
         }
-        val body = Regex.escape(phrase).replace(" ", "\\E[\\s\\-]+\\Q")
-        val s = if (plural) "s?" else ""
-        return Regex("(?<![\\p{L}\\p{N}])$body$s(?![\\p{L}\\p{N}])", RegexOption.IGNORE_CASE)
     }
 }

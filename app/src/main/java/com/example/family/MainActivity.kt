@@ -12,12 +12,14 @@ import android.os.Bundle
 import android.provider.Settings
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -39,6 +41,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.DropdownMenuItem
@@ -84,8 +87,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.abhi.familyprotection.ui.theme.FamilyTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -124,11 +129,13 @@ class MainActivity : ComponentActivity() {
 object DnsPreferences {
     private const val PREF_NAME = "dns_settings"
     private const val KEY_DNS_NAME = "dns_name"
+    const val DEFAULT_DNS_HOSTNAME = "family.adguard-dns.com"
     private const val KEY_TOTAL_YEARS = "total_years"
     private const val KEY_TOTAL_DAYS = "total_days"
     private const val KEY_TOTAL_HOURS = "total_hours"
     private const val KEY_TOTAL_MINS = "total_mins"
     private const val KEY_IS_ACTIVE = "is_active"
+    private const val KEY_DNS_LOCK_CONFIGURED = "dns_lock_configured"
     private const val KEY_EXPIRY_MILLIS = "expiry_millis"
     private const val KEY_PREV_MODE = "prev_dns_mode"
     private const val KEY_PREV_SPECIFIER = "prev_dns_specifier"
@@ -170,8 +177,8 @@ object DnsPreferences {
         if (now < cooldownUntil || BankingAccessibilityPause.hasPendingRestore(context)) {
             return BankingPauseStartResult.COOLDOWN_ACTIVE
         }
-        val pauseUntil = now + (15 * 60 * 1000L) // 15 minutes
-        val newCooldown = pauseUntil + (24 * 60 * 60 * 1000L) // 24 hours cooldown after pause
+        val pauseUntil = now + (5 * 60 * 1000L) // 5 minutes
+        val newCooldown = pauseUntil + (12 * 60 * 60 * 1000L) // 12 hours cooldown after pause
         val pausePrefs = getPrefs(context)
         if (!pausePrefs.edit()
             .putLong(KEY_BANKING_PAUSE_UNTIL, pauseUntil)
@@ -225,9 +232,18 @@ object DnsPreferences {
         if (isActive) {
             val now = SimpleDateFormat("dd/MM/yyyy HH:mm:ss", Locale.getDefault()).format(Date())
             editor.putString(KEY_INSTALL_TIME, now)
+        } else {
+            editor.putBoolean(KEY_DNS_LOCK_CONFIGURED, false)
         }
         
         editor.apply()
+    }
+
+    fun isDnsLockConfigured(context: Context): Boolean =
+        getPrefs(context).getBoolean(KEY_DNS_LOCK_CONFIGURED, false)
+
+    fun setDnsLockConfigured(context: Context, configured: Boolean) {
+        getPrefs(context).edit().putBoolean(KEY_DNS_LOCK_CONFIGURED, configured).apply()
     }
 
     fun getInstallTimestamp(context: Context): String =
@@ -367,43 +383,65 @@ object DnsPreferences {
         getPrefs(context).getLong(KEY_SCAN_PAUSE_UNTIL, 0L)
 
     fun getDnsName(context: Context): String =
-        getPrefs(context).getString(KEY_DNS_NAME, "") ?: ""
+        getPrefs(context).getString(KEY_DNS_NAME, DEFAULT_DNS_HOSTNAME) ?: DEFAULT_DNS_HOSTNAME
 
     fun getTotalYears(context: Context): String =
         getPrefs(context).getString(KEY_TOTAL_YEARS, "0") ?: "0"
 
     fun getTotalDays(context: Context): String =
-        getPrefs(context).getString(KEY_TOTAL_DAYS, "7") ?: "7"
+        getPrefs(context).getString(KEY_TOTAL_DAYS, "0") ?: "0"
 
     fun getTotalHours(context: Context): String =
         getPrefs(context).getString(KEY_TOTAL_HOURS, "0") ?: "0"
 
     fun getTotalMinutes(context: Context): String =
-        getPrefs(context).getString(KEY_TOTAL_MINS, "0") ?: "0"
+        getPrefs(context).getString(KEY_TOTAL_MINS, "3") ?: "3"
 
     fun isActive(context: Context): Boolean =
         getPrefs(context).getBoolean(KEY_IS_ACTIVE, false)
 
     fun getExpiryMillis(context: Context): Long =
         getPrefs(context).getLong(KEY_EXPIRY_MILLIS, 0L)
+
+    private const val KEY_LAST_VIOLATION_TIME = "last_violation_timestamp"
+
+    fun recordViolationTimestamp(context: Context, timestamp: Long = System.currentTimeMillis()) {
+        getPrefs(context).edit().putLong(KEY_LAST_VIOLATION_TIME, timestamp).apply()
+    }
+
+    fun getLastViolationTimestamp(context: Context): Long =
+        getPrefs(context).getLong(KEY_LAST_VIOLATION_TIME, 0L)
 }
 
 object DnsController {
     fun applyDns(context: Context, hostname: String): Result<Unit> {
         val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
-        val admin = FamilyDeviceAdminReceiver.getComponentName(context)
-
         return try {
             if (dpm != null && dpm.isDeviceOwnerApp(context.packageName)) {
-                // Enterprise-grade lock: Set as Global Settings via Device Owner
-                dpm.setGlobalSetting(admin, "private_dns_mode", "hostname")
-                dpm.setGlobalSetting(admin, "private_dns_specifier", hostname)
+                val success = DnsLock.lock(context, hostname)
+                if (success) {
+                    DnsPreferences.setDnsLockConfigured(context, true)
+                    Result.success(Unit)
+                } else {
+                    Result.failure(Exception("Failed to apply Device Owner DNS lock"))
+                }
             } else {
-                // Fallback for non-Device Owner (requires WRITE_SECURE_SETTINGS)
-                Settings.Global.putString(context.contentResolver, "private_dns_mode", "hostname")
-                Settings.Global.putString(context.contentResolver, "private_dns_specifier", hostname)
+                val modeUpdated = Settings.Global.putString(
+                    context.contentResolver,
+                    "private_dns_mode",
+                    "hostname"
+                )
+                val specifierUpdated = Settings.Global.putString(
+                    context.contentResolver,
+                    "private_dns_specifier",
+                    hostname
+                )
+                if (!modeUpdated || !specifierUpdated) {
+                    return Result.failure(Exception("Could not apply Private DNS settings"))
+                }
+                DnsPreferences.setDnsLockConfigured(context, true)
+                Result.success(Unit)
             }
-            Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)
         }
@@ -425,21 +463,17 @@ object DnsController {
 
     fun deactivateAndRestorePrevious(context: Context): Result<Unit> {
         val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
-        val admin = FamilyDeviceAdminReceiver.getComponentName(context)
-
         return try {
-            val prevMode = DnsPreferences.getPreviousDnsMode(context)
-            val prevSpecifier = DnsPreferences.getPreviousDnsSpecifier(context)
-
             if (dpm != null && dpm.isDeviceOwnerApp(context.packageName)) {
-                dpm.setGlobalSetting(admin, "private_dns_mode", prevMode)
-                dpm.setGlobalSetting(admin, "private_dns_specifier", prevSpecifier)
+                DnsLock.unlock(context)
             } else {
+                val prevMode = DnsPreferences.getPreviousDnsMode(context)
+                val prevSpecifier = DnsPreferences.getPreviousDnsSpecifier(context)
                 Settings.Global.putString(context.contentResolver, "private_dns_mode", prevMode)
                 Settings.Global.putString(context.contentResolver, "private_dns_specifier", prevSpecifier)
             }
             DnsPreferences.clearPreviousDns(context)
-
+            DnsPreferences.setDnsLockConfigured(context, false)
             Result.success(Unit)
         } catch (e: Exception) {
             Result.failure(e)
@@ -478,17 +512,98 @@ fun DnsControlScreen(isForeground: Boolean = true) {
     val drawerState = androidx.compose.material3.rememberDrawerState(DrawerValue.Closed)
     val coroutineScope = rememberCoroutineScope()
     var isBankingPaused by remember { mutableStateOf(DnsPreferences.isBankingPauseActive(context)) }
+    var hasBankingUsageAccess by remember { mutableStateOf(BankingAccessibilityPause.hasUsageAccess(context)) }
+    var showBankingAppPicker by remember { mutableStateOf(false) }
+    var isLoadingBankingApps by remember { mutableStateOf(false) }
+    var installedBankingCandidates by remember { mutableStateOf(emptyList<Pair<String, String>>()) }
+    var customBankingPackages by remember {
+        mutableStateOf(BankingAccessibilityPause.getCustomBankingPackages(context))
+    }
     var bankingPauseRemainingSec by remember { mutableLongStateOf(maxOf(0L, (DnsPreferences.getBankingPauseUntil(context) - System.currentTimeMillis()) / 1000L)) }
     var isOnBankingCooldown by remember { mutableStateOf(DnsPreferences.isOnBankingPauseCooldown(context)) }
     var bankingCooldownRemainingSec by remember { mutableLongStateOf(maxOf(0L, (DnsPreferences.getBankingPauseCooldownUntil(context) - System.currentTimeMillis()) / 1000L)) }
+
+    fun launchBankingAppWithAccessibilityPaused(packageName: String) {
+        val launchIntent = context.packageManager.getLaunchIntentForPackage(packageName)
+        if (launchIntent == null) {
+            Toast.makeText(context, "Could not find a launch activity for this app.", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (!BankingAccessibilityPause.isBankingOrFinancialApp(context, packageName)) {
+            Toast.makeText(context, "Select this app as a banking app first.", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (!BankingAccessibilityPause.hasUsageAccess(context)) {
+            Toast.makeText(context, "Enable Usage Access before opening banking apps.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        if (!BankingAccessibilityPause.isServiceEnabled(context)) {
+            try {
+                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(launchIntent)
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Could not launch banking app $packageName", e)
+                Toast.makeText(context, "Could not open the banking app.", Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+
+        if (!BankingAccessibilityPause.startAutomaticPause(context, packageName)) {
+            Toast.makeText(context, "Could not prepare the banking accessibility pause.", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (!DnsForegroundService.start(context)) {
+            BankingAccessibilityPause.endAutomaticPause(context)
+            Toast.makeText(context, "Could not start the banking foreground monitor.", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (!BankingAccessibilityPause.disableServiceInSettings(context)) {
+            BankingAccessibilityPause.endAutomaticPause(context)
+            if (!DnsPreferences.isActive(context)) DnsForegroundService.stop(context)
+            Toast.makeText(context, "Could not pause accessibility for the banking app.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        coroutineScope.launch {
+            var serviceDisabled = false
+            var attempts = 0
+            while (!serviceDisabled && attempts < 20) {
+                serviceDisabled = !BankingAccessibilityPause.isServiceEnabled(context)
+                if (!serviceDisabled) {
+                    delay(50L)
+                }
+                attempts++
+            }
+            if (!serviceDisabled) {
+                BankingAccessibilityPause.endAutomaticPause(context)
+                if (!DnsPreferences.isActive(context)) DnsForegroundService.stop(context)
+                Toast.makeText(context, "Accessibility did not turn off; banking app was not opened.", Toast.LENGTH_LONG).show()
+                return@launch
+            }
+
+            try {
+                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                context.startActivity(launchIntent)
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Could not launch banking app $packageName", e)
+                BankingAccessibilityPause.endAutomaticPause(context)
+                if (!DnsPreferences.isActive(context)) DnsForegroundService.stop(context)
+                Toast.makeText(context, "Could not open the banking app.", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
 
     // Dialog states
     var showPermissionDialog by remember { mutableStateOf(false) }
     var showLockConfirmDialog by remember { mutableStateOf(false) }
     var showUnlockPasswordDialog by remember { mutableStateOf(false) }
     var showAccessibilityHelpDialog by remember { mutableStateOf(false) }
+    var showBankingPausePasswordDialog by remember { mutableStateOf(false) }
     var unlockPasswordAttempt by remember { mutableStateOf("") }
+    var bankingPasswordAttempt by remember { mutableStateOf("") }
     var passwordErrorText by remember { mutableStateOf<String?>(null) }
+    var bankingPasswordErrorText by remember { mutableStateOf<String?>(null) }
 
     // Protection flags
     var isDeviceAdmin by remember { mutableStateOf(FamilyDeviceAdminReceiver.isDeviceAdmin(context)) }
@@ -512,7 +627,7 @@ fun DnsControlScreen(isForeground: Boolean = true) {
         if (isEmpty()) append("0m")
     }.trim()
 
-    // Permissions are granted outside the app, so re-read them whenever we return to the front.
+    // Live countdown and timer updates (pure memory calculation, no IPC overhead)
     LaunchedEffect(isForeground) {
         if (isForeground) {
             isDeviceAdmin = FamilyDeviceAdminReceiver.isDeviceAdmin(context)
@@ -521,45 +636,45 @@ fun DnsControlScreen(isForeground: Boolean = true) {
             while (true) {
                 val now = System.currentTimeMillis()
                 currentTimeMillis = now
-                isAccessibilityEnabled = AntiUninstallAccessibilityService.isEnabled(context)
-                isBankingPaused = now < DnsPreferences.getBankingPauseUntil(context) &&
-                    !isAccessibilityEnabled
-                bankingPauseRemainingSec = maxOf(
-                    0L,
-                    (DnsPreferences.getBankingPauseUntil(context) - now) / 1000L
-                )
-                isOnBankingCooldown = now < DnsPreferences.getBankingPauseCooldownUntil(context)
-                bankingCooldownRemainingSec = maxOf(
-                    0L,
-                    (DnsPreferences.getBankingPauseCooldownUntil(context) - now) / 1000L
-                )
+                hasBankingUsageAccess = BankingAccessibilityPause.hasUsageAccess(context)
+                val bankingUntil = DnsPreferences.getBankingPauseUntil(context)
+                val bankingCooldown = DnsPreferences.getBankingPauseCooldownUntil(context)
+                isBankingPaused = now < bankingUntil && !isAccessibilityEnabled
+                bankingPauseRemainingSec = maxOf(0L, (bankingUntil - now) / 1000L)
+                isOnBankingCooldown = now < bankingCooldown
+                bankingCooldownRemainingSec = maxOf(0L, (bankingCooldown - now) / 1000L)
+
+                if (currentTimeMillis >= expiryMillis && expiryMillis > 0L) {
+                    isActive = false
+                    hasPasswordActive = false
+                    DnsForegroundService.stop(context)
+                    VigilanceWatchdogAlarm.cancel(context)
+                    WatchdogScheduler.cancel(context)
+                }
+
                 delay(1000L)
             }
         }
     }
 
-    // Live countdown, Expiry handling & Anti-Tamper Loop
-    LaunchedEffect(isActive, isForeground) {
-        var tick = 0
-        while (isActive && isForeground) {
-            currentTimeMillis = System.currentTimeMillis()
-
-            // Permission state almost never changes; re-query it every 30s instead of every tick.
-            if (tick % 6 == 0) {
-                isDeviceAdmin = FamilyDeviceAdminReceiver.isDeviceAdmin(context)
-                isDeviceOwner = FamilyDeviceAdminReceiver.isDeviceOwner(context)
-                isAccessibilityEnabled = AntiUninstallAccessibilityService.isEnabled(context)
+    // Periodic permission/service status check on IO dispatcher to avoid main thread binder contention
+    LaunchedEffect(isForeground) {
+        if (isForeground) {
+            while (true) {
+                val admin = withContext(Dispatchers.IO) {
+                    FamilyDeviceAdminReceiver.isDeviceAdmin(context)
+                }
+                val owner = withContext(Dispatchers.IO) {
+                    FamilyDeviceAdminReceiver.isDeviceOwner(context)
+                }
+                val accessibility = withContext(Dispatchers.IO) {
+                    AntiUninstallAccessibilityService.isEnabled(context)
+                }
+                isDeviceAdmin = admin
+                isDeviceOwner = owner
+                isAccessibilityEnabled = accessibility
+                delay(5000L)
             }
-            tick++
-
-            // Check status and update UI, but let DnsForegroundService handle the enforcement
-            if (currentTimeMillis >= expiryMillis) {
-                isActive = false
-                hasPasswordActive = false
-                DnsForegroundService.stop(context)
-            }
-
-            delay(5000L)
         }
     }
 
@@ -698,9 +813,13 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                         // Emergency Restore Button (DNS Tab)
                         OutlinedButton(
                             onClick = {
-                                FamilyDeviceAdminReceiver.setUninstallBlocked(context, false)
-                                DnsController.deactivateAndRestorePrevious(context)
-                                Toast.makeText(context, "System restrictions cleared and settings restored!", Toast.LENGTH_LONG).show()
+                                coroutineScope.launch(Dispatchers.IO) {
+                                    DnsController.deactivateAndRestorePrevious(context)
+                                    withContext(Dispatchers.Main) {
+                                        FamilyDeviceAdminReceiver.setUninstallBlocked(context, true)
+                                        Toast.makeText(context, "System restrictions cleared and settings restored. App uninstall remains blocked.", Toast.LENGTH_LONG).show()
+                                    }
+                                }
                             },
                             enabled = !isActive,
                             modifier = Modifier.fillMaxWidth(),
@@ -739,11 +858,16 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                             val mins = (bankingCooldownRemainingSec % 3600L) / 60L
                             val secs = bankingCooldownRemainingSec % 60L
                             val cooldownText = if (hours > 0) "${hours}h ${mins}m" else "${mins}m ${secs}s"
+                            Text(
+                                "This cooldown affects only the manual emergency pause. Automatic banking-app detection remains active.",
+                                fontSize = 12.sp,
+                                color = Color.DarkGray
+                            )
                             OutlinedButton(
                                 onClick = {
                                     Toast.makeText(
                                         context,
-                                        "24-Hour Cooldown Active. Next pause available in $cooldownText",
+                                        "12-Hour Cooldown Active. Next pause available in $cooldownText",
                                         Toast.LENGTH_LONG
                                     ).show()
                                 },
@@ -751,7 +875,7 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = RoundedCornerShape(12.dp)
                             ) {
-                                Text("⏳ 24h Cooldown Active ($cooldownText left)", fontSize = 12.sp, color = Color.Gray)
+                                Text("⏳ 12h Cooldown Active ($cooldownText left)", fontSize = 12.sp, color = Color.Gray)
                             }
                         } else {
                             Button(
@@ -772,7 +896,7 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                                             isAccessibilityEnabled = false
                                             Toast.makeText(
                                                 context,
-                                                "Accessibility disabled for 15 minutes. A 24-hour cooldown follows.",
+                                                "Emergency accessibility pause active for 5 minutes. A 12-hour cooldown follows.",
                                                 Toast.LENGTH_LONG
                                             ).show()
                                         }
@@ -788,7 +912,7 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                                         BankingPauseStartResult.WRITE_PERMISSION_MISSING ->
                                             Toast.makeText(context, "The required secure-settings permission is not granted.", Toast.LENGTH_LONG).show()
                                         BankingPauseStartResult.SETTING_WRITE_FAILED ->
-                                            Toast.makeText(context, "Could not disable Accessibility. Check the app log for details.", Toast.LENGTH_LONG).show()
+                                            Toast.makeText(context, "Could not start emergency pause. Check the app log for details.", Toast.LENGTH_LONG).show()
                                     }
                                 },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F)),
@@ -797,7 +921,7 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                                     .height(52.dp),
                                 shape = RoundedCornerShape(12.dp)
                             ) {
-                                Text("🛑 Disable Accessibility for 15 Mins (24h Cooldown)", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                Text("🛑 Emergency Accessibility Pause for 5 Mins (12h Cooldown)", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                             }
                         }
                     }
@@ -1007,13 +1131,14 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                                 }
                             }
                         }
+
                     }
                 }
             }
 
             // --- DNS Hostname Input & Presets ---
             val dnsProviders = listOf(
-                DnsProvider("AdGuard (Family) | family.adguard-dns.com", "family.adguard-dns.com", "Blocks ads, trackers, and adult content"),
+                DnsProvider("AdGuard (Family) | family.adguard-dns.com", DnsPreferences.DEFAULT_DNS_HOSTNAME, "Blocks ads, trackers, and adult content"),
                 DnsProvider("AdGuard (Standard) | dns.adguard.com", "dns.adguard.com", "Blocks ads and trackers"),
                 DnsProvider("Cloudflare (Family) | family.cloudflare-dns.com ", "family.cloudflare-dns.com", "Blocks malware and adult content"),
                 DnsProvider("Cloudflare (Standard) | 1dot1dot1dot1.cloudflare-dns.com", "1dot1dot1dot1.cloudflare-dns.com", "Fastest privacy-focused DNS"),
@@ -1229,6 +1354,114 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                         }
                     }
                 }
+
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFF3F4F6))
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            "Banking app accessibility pause",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp
+                        )
+                        Text(
+                            if (hasBankingUsageAccess) {
+                                "Usage Access is enabled. Accessibility pauses only for selected apps in the foreground."
+                            } else {
+                                "Enable Usage Access so accessibility can resume after you leave a selected bank app."
+                            },
+                            fontSize = 12.sp,
+                            color = Color.DarkGray
+                        )
+                        if (!hasBankingUsageAccess) {
+                            OutlinedButton(
+                                onClick = {
+                                    try {
+                                        context.startActivity(
+                                            Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
+                                        )
+                                    } catch (e: Exception) {
+                                        Log.e("MainActivity", "Could not open Usage Access settings", e)
+                                        Toast.makeText(
+                                            context,
+                                            "Could not open Usage Access settings.",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Enable Usage Access")
+                            }
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                if (installedBankingCandidates.isEmpty()) {
+                                    isLoadingBankingApps = true
+                                    coroutineScope.launch {
+                                        try {
+                                            val candidates = withContext(Dispatchers.IO) {
+                                                val launcherIntent = Intent(Intent.ACTION_MAIN).apply {
+                                                    addCategory(Intent.CATEGORY_LAUNCHER)
+                                                }
+                                                @Suppress("DEPRECATION")
+                                                context.packageManager.queryIntentActivities(launcherIntent, 0)
+                                                    .mapNotNull { resolved ->
+                                                        val appInfo = resolved.activityInfo.applicationInfo
+                                                            ?: return@mapNotNull null
+                                                        val packageName = resolved.activityInfo.packageName
+                                                        if (packageName == context.packageName) return@mapNotNull null
+                                                        val label = context.packageManager
+                                                            .getApplicationLabel(appInfo)
+                                                            .toString()
+                                                        packageName to label
+                                                    }
+                                                    .distinctBy { it.first }
+                                                    .sortedBy { it.second.lowercase(Locale.getDefault()) }
+                                            }
+                                            installedBankingCandidates = candidates
+                                            customBankingPackages =
+                                                BankingAccessibilityPause.getCustomBankingPackages(context)
+                                            showBankingAppPicker = true
+                                        } catch (e: Exception) {
+                                            Log.e("MainActivity", "Could not load installed apps", e)
+                                            Toast.makeText(
+                                                context,
+                                                "Could not load installed apps.",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        } finally {
+                                            isLoadingBankingApps = false
+                                        }
+                                    }
+                                } else {
+                                    customBankingPackages =
+                                        BankingAccessibilityPause.getCustomBankingPackages(context)
+                                    showBankingAppPicker = true
+                                }
+                            },
+                            enabled = !isLoadingBankingApps,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                if (isLoadingBankingApps) "Loading installed apps..."
+                                else "Choose banking apps"
+                            )
+                        }
+                        Text(
+                            "${customBankingPackages.size} custom app(s) selected",
+                            fontSize = 12.sp,
+                            color = Color.Gray
+                        )
+                    }
+                }
             }
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -1304,15 +1537,21 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                         if (savedPassword != null) {
                             if (unlockPasswordAttempt.trim() == savedPassword) {
                                 showUnlockPasswordDialog = false
-                                DnsController.deactivateAndRestorePrevious(context)
-                                FamilyDeviceAdminReceiver.setUninstallBlocked(context, false)
-                                DnsExpiryReceiver.cancelExpiryAlarm(context)
-                                DnsForegroundService.stop(context)
-                                DnsPreferences.clearPassword(context)
-                                isActive = false
-                                hasPasswordActive = false
-                                DnsPreferences.saveDnsState(context, dnsName, totalYears, totalDays, totalHours, totalMinutes, false, 0L)
-                                Toast.makeText(context, "Password verified! App unlocked and uninstall allowed.", Toast.LENGTH_LONG).show()
+                                coroutineScope.launch(Dispatchers.IO) {
+                                    DnsController.deactivateAndRestorePrevious(context)
+                                    withContext(Dispatchers.Main) {
+                                        FamilyDeviceAdminReceiver.setUninstallBlocked(context, true)
+                                        DnsExpiryReceiver.cancelExpiryAlarm(context)
+                                        DnsForegroundService.stop(context)
+                                        VigilanceWatchdogAlarm.cancel(context)
+                                        WatchdogScheduler.cancel(context)
+                                        try { DnsPreferences.clearPassword(context) } catch (_: Exception) {}
+                                        isActive = false
+                                        hasPasswordActive = false
+                                        DnsPreferences.saveDnsState(context, dnsName, totalYears, totalDays, totalHours, totalMinutes, false, 0L)
+                                        Toast.makeText(context, "Password verified! DNS lock unlocked. App uninstall remains blocked.", Toast.LENGTH_LONG).show()
+                                    }
+                                }
                             } else {
                                 passwordErrorText = "Incorrect password! Lock remains active."
                             }
@@ -1324,6 +1563,95 @@ fun DnsControlScreen(isForeground: Boolean = true) {
             },
             dismissButton = {
                 TextButton(onClick = { showUnlockPasswordDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // --- Banking Pause Password Dialog ---
+    if (showBankingPausePasswordDialog) {
+        AlertDialog(
+            onDismissRequest = { showBankingPausePasswordDialog = false },
+            title = { Text("🔑 Password Required") },
+            text = {
+                Column {
+                    Text("Enter your password to authorize the 15-minute banking pause:\n")
+                    OutlinedTextField(
+                        value = bankingPasswordAttempt,
+                        onValueChange = {
+                            bankingPasswordAttempt = it
+                            bankingPasswordErrorText = null
+                        },
+                        label = { Text("Password") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                        isError = bankingPasswordErrorText != null,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    if (bankingPasswordErrorText != null) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = bankingPasswordErrorText ?: "",
+                            color = MaterialTheme.colorScheme.error,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val savedPassword = try {
+                            DnsPreferences.getPassword(context)
+                        } catch (e: IllegalStateException) {
+                            bankingPasswordErrorText = "Could not read the saved password."
+                            null
+                        }
+                        if (savedPassword != null) {
+                            if (bankingPasswordAttempt.trim() == savedPassword) {
+                                showBankingPausePasswordDialog = false
+                                when (DnsPreferences.startBankingPause(context)) {
+                                    BankingPauseStartResult.STARTED -> {
+                                        val now = System.currentTimeMillis()
+                                        isBankingPaused = true
+                                        bankingPauseRemainingSec = maxOf(
+                                            0L,
+                                            (DnsPreferences.getBankingPauseUntil(context) - now) / 1000L
+                                        )
+                                        isOnBankingCooldown = true
+                                        bankingCooldownRemainingSec = maxOf(
+                                            0L,
+                                            (DnsPreferences.getBankingPauseCooldownUntil(context) - now) / 1000L
+                                        )
+                                        Toast.makeText(
+                                            context,
+                                            "Password verified! Emergency pause active for 5 minutes.",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                    BankingPauseStartResult.COOLDOWN_ACTIVE -> {
+                                        isOnBankingCooldown = true
+                                        bankingCooldownRemainingSec = maxOf(
+                                            0L,
+                                            (DnsPreferences.getBankingPauseCooldownUntil(context) - System.currentTimeMillis()) / 1000L
+                                        )
+                                        Toast.makeText(context, "12-Hour Cooldown Active.", Toast.LENGTH_LONG).show()
+                                    }
+                                    else -> Toast.makeText(context, "Could not start banking pause.", Toast.LENGTH_LONG).show()
+                                }
+                            } else {
+                                bankingPasswordErrorText = "Incorrect password!"
+                            }
+                        }
+                    }
+                ) {
+                    Text("Verify & Pause")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBankingPausePasswordDialog = false }) {
                     Text("Cancel")
                 }
             }
@@ -1360,28 +1688,41 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                     onClick = {
                         showLockConfirmDialog = false
                         val trimmedDns = dnsName.trim()
-                        val result = DnsController.activateWithPriority(context, trimmedDns)
-                        if (result.isSuccess) {
-                            val newExpiry = System.currentTimeMillis() + totalDurationMillis
-                            expiryMillis = newExpiry
-                            isActive = true
+                        coroutineScope.launch(Dispatchers.IO) {
+                            val result = DnsController.activateWithPriority(context.applicationContext, trimmedDns)
+                            val errorMsg = result.exceptionOrNull()?.message ?: "Unknown DPM error"
+                            Log.d("DnsActivation", "Activation result: isSuccess=${result.isSuccess}, error=$errorMsg")
+                            withContext(Dispatchers.Main) {
+                                if (result.isSuccess) {
+                                    val newExpiry = System.currentTimeMillis() + totalDurationMillis
+                                    expiryMillis = newExpiry
+                                    isActive = true
 
-                            // Handle password
-                            if (usePasswordToggle && passwordInput.isNotBlank()) {
-                                DnsPreferences.savePassword(context, passwordInput.trim())
-                                hasPasswordActive = true
-                            } else {
-                                DnsPreferences.clearPassword(context)
-                                hasPasswordActive = false
+                                    // Handle password
+                                    if (usePasswordToggle && passwordInput.isNotBlank()) {
+                                        try {
+                                            DnsPreferences.savePassword(context, passwordInput.trim())
+                                            hasPasswordActive = true
+                                        } catch (_: Exception) {}
+                                    } else {
+                                        try {
+                                            DnsPreferences.clearPassword(context)
+                                        } catch (_: Exception) {}
+                                        hasPasswordActive = false
+                                    }
+
+                                    DnsPreferences.saveDnsState(context, trimmedDns, totalYears, totalDays, totalHours, totalMinutes, true, newExpiry)
+                                    DnsExpiryReceiver.scheduleExpiryAlarm(context, newExpiry)
+                                    FamilyDeviceAdminReceiver.setUninstallBlocked(context, true)
+                                    DnsForegroundService.start(context.applicationContext)
+                                    WatchdogScheduler.schedule(context.applicationContext)
+                                    Toast.makeText(context, "Lock engaged for $durationLabelFormatted!", Toast.LENGTH_SHORT).show()
+                                } else {
+                                    Log.e("DnsActivation", "Activation failed: $errorMsg")
+                                    Toast.makeText(context, "Activation failed: $errorMsg", Toast.LENGTH_LONG).show()
+                                    showPermissionDialog = true
+                                }
                             }
-
-                            DnsPreferences.saveDnsState(context, trimmedDns, totalYears, totalDays, totalHours, totalMinutes, true, newExpiry)
-                            DnsExpiryReceiver.scheduleExpiryAlarm(context, newExpiry)
-                            FamilyDeviceAdminReceiver.setUninstallBlocked(context, true)
-                            DnsForegroundService.start(context)
-                            Toast.makeText(context, "Lock engaged for $durationLabelFormatted!", Toast.LENGTH_SHORT).show()
-                        } else {
-                            showPermissionDialog = true
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
@@ -1398,6 +1739,80 @@ fun DnsControlScreen(isForeground: Boolean = true) {
     }
 
     // --- ADB Permission Dialog ---
+    if (showBankingAppPicker) {
+        AlertDialog(
+            onDismissRequest = { showBankingAppPicker = false },
+            title = { Text("Banking apps") },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(450.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        "Select exact apps to pause accessibility for. Use Open beside a bank app to disable accessibility before launching it.",
+                        fontSize = 13.sp
+                    )
+                    if (installedBankingCandidates.isEmpty()) {
+                        Text("No launchable apps were found.", fontSize = 12.sp, color = Color.Gray)
+                    }
+                    installedBankingCandidates.forEach { (packageName, label) ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    if (customBankingPackages.contains(packageName)) {
+                                        BankingAccessibilityPause.removeBankingPackage(context, packageName)
+                                    } else if (!BankingAccessibilityPause.addBankingPackage(context, packageName)) {
+                                        Toast.makeText(context, "Could not add $packageName", Toast.LENGTH_SHORT).show()
+                                    }
+                                    customBankingPackages =
+                                        BankingAccessibilityPause.getCustomBankingPackages(context)
+                                }
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = customBankingPackages.contains(packageName),
+                                onCheckedChange = { checked ->
+                                    if (checked) {
+                                        if (!BankingAccessibilityPause.addBankingPackage(context, packageName)) {
+                                            Toast.makeText(context, "Could not add $packageName", Toast.LENGTH_SHORT).show()
+                                        }
+                                    } else {
+                                        BankingAccessibilityPause.removeBankingPackage(context, packageName)
+                                    }
+                                    customBankingPackages =
+                                        BankingAccessibilityPause.getCustomBankingPackages(context)
+                                }
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(label)
+                                Text(packageName, fontSize = 11.sp, color = Color.Gray)
+                            }
+                            if (BankingAccessibilityPause.isBankingOrFinancialApp(context, packageName)) {
+                                TextButton(
+                                    onClick = {
+                                        showBankingAppPicker = false
+                                        launchBankingAppWithAccessibilityPaused(packageName)
+                                    }
+                                ) {
+                                    Text("Open")
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showBankingAppPicker = false }) {
+                    Text("Done")
+                }
+            }
+        )
+    }
+
     if (showPermissionDialog) {
         val adbCommand = "adb shell pm grant com.abhi.familyprotection android.permission.WRITE_SECURE_SETTINGS"
         AlertDialog(

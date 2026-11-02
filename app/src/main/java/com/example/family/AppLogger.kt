@@ -62,10 +62,16 @@ object AppLogger {
     @Volatile
     private var cachedLoggingEnabled: Boolean? = null
 
-    private fun getPrefs(context: Context): SharedPreferences {
-        return context.createDeviceProtectedStorageContext()
-            .getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-    }
+    @Volatile
+    private var cachedPrefs: SharedPreferences? = null
+
+    private fun getPrefs(context: Context): SharedPreferences =
+        cachedPrefs ?: synchronized(this) {
+            cachedPrefs ?: context.applicationContext
+                .createDeviceProtectedStorageContext()
+                .getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                .also { cachedPrefs = it }
+        }
 
     fun isLoggingEnabled(context: Context): Boolean {
         cachedLoggingEnabled?.let { return it }
@@ -153,7 +159,9 @@ object AppLogger {
                 .forEach { (file, entries) ->
                     try {
                         file.appendText(entries.joinToString(separator = "\n", postfix = "\n") { it.entry })
-                        file.writeText(readLastLogLines(file).joinToString(separator = "\n", postfix = "\n"))
+                        if (file.length() > 100 * 1024L) {
+                            file.writeText(readLastLogLines(file).joinToString(separator = "\n", postfix = "\n"))
+                        }
                     } catch (e: IOException) {
                         Log.e("AppLogger", "Unable to persist app log entries", e)
                     } catch (e: SecurityException) {
@@ -174,8 +182,13 @@ object AppLogger {
         return lines.toList()
     }
 
-    private fun getLogFile(context: Context): File {
-        val dir = context.createDeviceProtectedStorageContext().filesDir
-        return File(dir, LOG_FILE_NAME)
-    }
+    @Volatile private var cachedLogFile: File? = null
+
+    private fun getLogFile(context: Context): File =
+        cachedLogFile ?: synchronized(this) {
+            cachedLogFile ?: File(
+                context.applicationContext.createDeviceProtectedStorageContext().filesDir,
+                LOG_FILE_NAME
+            ).also { cachedLogFile = it }
+        }
 }

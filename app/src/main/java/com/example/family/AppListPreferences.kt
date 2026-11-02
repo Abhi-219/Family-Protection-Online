@@ -2,6 +2,7 @@ package com.abhi.familyprotection
 
 import android.content.Context
 import android.content.SharedPreferences
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Stores and manages customizable lists of blocked adult apps and monitored social/browser apps.
@@ -44,10 +45,15 @@ object AppListPreferences {
         "com.qwant.liberty", "com.ghostery.android.ghostery", "com.fingerprintbrowser"
     )
 
-    private fun getPrefs(context: Context): SharedPreferences {
-        return context.createDeviceProtectedStorageContext()
-            .getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
-    }
+    @Volatile private var cachedPrefs: SharedPreferences? = null
+
+    private fun getPrefs(context: Context): SharedPreferences =
+        cachedPrefs ?: synchronized(this) {
+            cachedPrefs ?: context.applicationContext
+                .createDeviceProtectedStorageContext()
+                .getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+                .also { cachedPrefs = it }
+        }
 
     fun getCustomBlockedAdultApps(context: Context): Set<String> {
         return getPrefs(context).getStringSet(KEY_CUSTOM_BLOCKED_ADULT, emptySet()) ?: emptySet()
@@ -116,32 +122,37 @@ object AppListPreferences {
     fun getAllSupervisedPatterns(context: Context): Set<String> =
         getCustomSupervisedPatterns(context)
 
+    private val SEGMENT_REGEX = Regex("[A-Za-z0-9_]+")
+    private val patternCache = ConcurrentHashMap<String, Regex>()
+
     fun isValidPackageName(packageName: String): Boolean =
         isValidPackagePattern(packageName)
 
     fun isValidPackagePattern(pattern: String): Boolean {
         val segments = pattern.trim().split('.')
         return segments.size >= 2 && segments.all { segment ->
-            segment == "*" || segment == "**" || segment.matches(Regex("[A-Za-z0-9_]+"))
+            segment == "*" || segment == "**" || segment.matches(SEGMENT_REGEX)
         }
     }
 
     fun wildcardToPackageRegex(pattern: String): Regex {
-        require(isValidPackagePattern(pattern)) { "Invalid package-name pattern" }
-        val segments = pattern.trim().lowercase().split('.')
-        val regexString = buildString {
-            append("^")
-            segments.forEachIndexed { index, segment ->
-                if (index > 0) append("\\.")
-                when (segment) {
-                    "*" -> append("[^.]+")
-                    "**" -> append("[^.]+(?:\\.[^.]+)*")
-                    else -> append(Regex.escape(segment))
+        return patternCache.getOrPut(pattern) {
+            require(isValidPackagePattern(pattern)) { "Invalid package-name pattern" }
+            val segments = pattern.trim().lowercase().split('.')
+            val regexString = buildString {
+                append("^")
+                segments.forEachIndexed { index, segment ->
+                    if (index > 0) append("\\.")
+                    when (segment) {
+                        "*" -> append("[^.]+")
+                        "**" -> append("[^.]+(?:\\.[^.]+)*")
+                        else -> append(Regex.escape(segment))
+                    }
                 }
+                append("$")
             }
-            append("$")
+            Regex(regexString, RegexOption.IGNORE_CASE)
         }
-        return Regex(regexString, RegexOption.IGNORE_CASE)
     }
 
     fun matchesPattern(pkgName: String, pattern: String): Boolean {

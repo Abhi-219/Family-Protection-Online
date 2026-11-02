@@ -1,5 +1,6 @@
 *.iml
-.gradle
+/.gradle/
+/.kotlin/
 /local.properties
 /.idea/caches
 /.idea/libraries
@@ -13,3 +14,12 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Android/Gradle build outputs
+**/build/
+*.apk
+*.aab
+
+# Local generated workspace data
+/.artifacts/
+/TempFiles/

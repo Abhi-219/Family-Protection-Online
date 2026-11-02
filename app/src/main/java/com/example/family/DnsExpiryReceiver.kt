@@ -60,6 +60,8 @@ class DnsExpiryReceiver : BroadcastReceiver() {
             ACTION_DEACTIVATE_DNS -> {
                 Log.d(TAG, "Timer expired. Restoring previous DNS settings...")
                 deactivateAndRestore(context)
+                VigilanceWatchdogAlarm.cancel(context)
+                WatchdogScheduler.cancel(context)
                 DnsForegroundService.stop(context)
             }
             Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_LOCKED_BOOT_COMPLETED -> {
@@ -71,6 +73,8 @@ class DnsExpiryReceiver : BroadcastReceiver() {
                 if (isActive) {
                     if (now >= expiryMillis) {
                         deactivateAndRestore(context)
+                        VigilanceWatchdogAlarm.cancel(context)
+                        WatchdogScheduler.cancel(context)
                         DnsForegroundService.stop(context)
                     } else {
                         // Restore DNS immediately
@@ -79,6 +83,9 @@ class DnsExpiryReceiver : BroadcastReceiver() {
                             DnsController.applyDns(context, currentDns)
                         }
                         scheduleExpiryAlarm(context, expiryMillis)
+                        if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
+                            WatchdogScheduler.schedule(context)
+                        }
                         DnsForegroundService.start(context)
                     }
                 }

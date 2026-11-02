@@ -13,11 +13,14 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * On-device adult content detector (v4).
@@ -43,6 +46,7 @@ class SmartContentDetector(private val context: Context) {
     )
     private val textRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private var nsfwInterpreter: InterpreterApi? = null
+    private val benignContentCache = ConcurrentHashMap<String, BenignContentCache>()
 
     // Reused across passes; callers must serialise analyzeContent (the service does).
     private val nsfwPixels by lazy { IntArray(NSFW_INPUT_SIZE * NSFW_INPUT_SIZE) }
@@ -72,8 +76,11 @@ class SmartContentDetector(private val context: Context) {
         val immediateResult: DetectionResult? = null
     )
 
+    private data class BenignContentCache(val contentHash: Int, val analyzedAt: Long)
+
     companion object {
         private const val TAG = "SmartContentDetector"
+        private const val UNCHANGED_BENIGN_CACHE_MS = 6000L
 
         // Set true once to see which accessibility view IDs Chrome uses, then adjust the ID lists below.
         private const val DEBUG_NODE_IDS = false
@@ -209,12 +216,23 @@ class SmartContentDetector(private val context: Context) {
     suspend fun analyzeContent(
         packageName: String,
         rootNode: AccessibilityNodeInfo?,
-        screenshotProvider: (suspend () -> Bitmap?)? = null
+        screenshotProvider: (suspend () -> Bitmap?)? = null,
+        forceRecheck: Boolean = false
     ): DetectionResult = withContext(Dispatchers.Default) {
 
         try {
             // Step 1: Extract text, split by source
             val screen = extractScreenText(rootNode)
+            val contentHash = "${screen.query}\u001F${screen.suggestions}\u001F${screen.page}".hashCode()
+            val now = System.currentTimeMillis()
+            val cached = benignContentCache[packageName]
+            if (!forceRecheck && cached?.contentHash == contentHash &&
+                now - cached.analyzedAt < UNCHANGED_BENIGN_CACHE_MS
+            ) {
+                return@withContext DetectionResult(false, 0f, "Safe (unchanged content)", "cached")
+            }
+            benignContentCache.remove(packageName)
+
             val suggestionsVisible = screen.suggestions.isNotBlank()
             val suggestionText = TextNormalizer.normalize(applyExceptions(screen.suggestions))
             val queryText = screen.query
@@ -223,6 +241,7 @@ class SmartContentDetector(private val context: Context) {
             // Step 2: assess accessibility text with TextNormalizer (decodes leetspeak and symbols)
             var mainText = TextNormalizer.normalize(applyExceptions("$queryText $pageText".trim()))
             hardBlock(mainText)?.let {
+                benignContentCache.remove(packageName)
                 val appName = SmsSender.resolveAppName(context, packageName)
                 val matchedKeywords = it.reason.removePrefix("Red list: ")
                 AppLogger.log(
@@ -241,33 +260,42 @@ class SmartContentDetector(private val context: Context) {
             }
             var assessment = assessText(packageName, mainText, suggestionText)
             assessment.immediateResult?.let {
-                val appName = SmsSender.resolveAppName(context, packageName)
-                val matchedKeywords = assessment.mainResult.counts
-                    .filterValues { count -> count > 0 }
-                    .keys
-                    .joinToString(", ") { pattern -> pattern.phrase }
-                AppLogger.log(
-                    context,
-                    "[KEYWORD_DETECTION] app=$appName | pkg=$packageName | keywords=$matchedKeywords | reason=${it.reason} | method=${it.method}",
-                    "SmartContentDetector",
-                    "W"
-                )
-                SmsSender.sendKeywordAlert(
-                    context,
-                    SmsSender.resolveAppName(context, packageName),
-                    packageName,
-                    it.reason
-                )
+                if (it.isBlocked) {
+                    benignContentCache.remove(packageName)
+                    val appName = SmsSender.resolveAppName(context, packageName)
+                    val matchedKeywords = assessment.mainResult.counts
+                        .filterValues { count -> count > 0 }
+                        .keys
+                        .joinToString(", ") { pattern -> pattern.phrase }
+                    AppLogger.log(
+                        context,
+                        "[KEYWORD_DETECTION] app=$appName | pkg=$packageName | keywords=$matchedKeywords | reason=${it.reason} | method=${it.method}",
+                        "SmartContentDetector",
+                        "W"
+                    )
+                    SmsSender.sendKeywordAlert(
+                        context,
+                        SmsSender.resolveAppName(context, packageName),
+                        packageName,
+                        it.reason
+                    )
+                } else {
+                    benignContentCache[packageName] = BenignContentCache(contentHash, now)
+                }
                 return@withContext it
             }
 
             // Step 3: Image analysis, only when text isn't already decisive.
-            // Redundant OCR removed to save ~50% CPU/battery during browsing.
-            val imageScore = if (assessment.effectiveTextScore >= IMAGE_SKIP_TEXT) {
-                0f
-            } else {
-                val screenshot = if (!suggestionsVisible) screenshotProvider?.invoke() else null
-                screenshot?.let { analyzeImage(it) } ?: 0f
+            var screenshot: Bitmap? = null
+            val imageScore = try {
+                if (assessment.effectiveTextScore >= IMAGE_SKIP_TEXT) {
+                    0f
+                } else {
+                    screenshot = if (!suggestionsVisible) screenshotProvider?.invoke() else null
+                    screenshot?.let { analyzeImage(it) } ?: 0f
+                }
+            } finally {
+                screenshot?.recycle()
             }
 
             // Step 4: Decision
@@ -283,6 +311,7 @@ class SmartContentDetector(private val context: Context) {
             val finalScore = minOf(1f, maxOf(assessment.effectiveTextScore, imageScore))
 
             if (blocked) {
+                benignContentCache.remove(packageName)
                 val appName = SmsSender.resolveAppName(context, packageName)
                 val matchedKeywords = assessment.mainResult.counts
                     .filterValues { count -> count > 0 }
@@ -302,6 +331,7 @@ class SmartContentDetector(private val context: Context) {
                 Log.d(TAG, "Result: package=$packageName | text=${assessment.effectiveTextScore} | image=$imageScore | " +
                         "matched=${assessment.mainResult.counts.keys.joinToString { it.phrase }} | blocked=false")
             }
+            if (!blocked) benignContentCache[packageName] = BenignContentCache(contentHash, now)
 
             DetectionResult(
                 isBlocked = blocked,
@@ -312,6 +342,7 @@ class SmartContentDetector(private val context: Context) {
 
         } catch (e: Exception) {
             Log.e(TAG, "Analysis failed", e)
+            benignContentCache.remove(packageName)
             DetectionResult(false, 0f, "Error: ${e.message}", "error")
         }
     }
@@ -530,7 +561,9 @@ class SmartContentDetector(private val context: Context) {
         )
     }
 
-    private suspend fun analyzeWithNsfwModel(bitmap: Bitmap): Float {
+    private val tfliteMutex = Mutex()
+
+    private suspend fun analyzeWithNsfwModel(bitmap: Bitmap): Float = tfliteMutex.withLock {
         val resized = Bitmap.createScaledBitmap(bitmap, NSFW_INPUT_SIZE, NSFW_INPUT_SIZE, true)
         try {
             resized.getPixels(nsfwPixels, 0, NSFW_INPUT_SIZE, 0, 0, NSFW_INPUT_SIZE, NSFW_INPUT_SIZE)
@@ -550,7 +583,7 @@ class SmartContentDetector(private val context: Context) {
         getNsfwInterpreter().run(nsfwInput, output)
         val score = output[0][1].coerceIn(0f, 1f)
         if (VERBOSE_LOGS) Log.d(TAG, "TFLite NSFW score: $score")
-        return score
+        score
     }
 
     private fun loadModelFile(fileName: String): ByteBuffer {
@@ -646,6 +679,7 @@ class SmartContentDetector(private val context: Context) {
     }
 
     fun cleanup() {
+        benignContentCache.clear()
         imageLabeler.close()
         textRecognizer.close()
         nsfwInterpreter?.close()

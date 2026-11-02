@@ -3,15 +3,18 @@ package com.abhi.familyprotection
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityService.ScreenshotResult
 import android.accessibilityservice.AccessibilityService.TakeScreenshotCallback
+import android.app.admin.DevicePolicyManager
 import android.content.Context
 import android.content.SharedPreferences
 import android.database.ContentObserver
 import android.net.Uri
 import android.graphics.Bitmap
 import android.graphics.Rect
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
@@ -19,6 +22,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.Toast
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import java.util.concurrent.ConcurrentHashMap
@@ -27,9 +31,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 class AntiUninstallAccessibilityService : AccessibilityService() {
 
     private data class AppScanState(
-        var lastScanTime: Long = 0L,
-        var lastAiScanTime: Long = 0L,
-        var lastBlockedTime: Long = 0L
+        @Volatile var lastScanTime: Long = 0L,
+        @Volatile var lastAiScanTime: Long = 0L,
+        @Volatile var lastBlockedTime: Long = 0L,
+        @Volatile var lastContentHash: Int? = null,
+        @Volatile var lastContentWasBenign: Boolean = false
     )
 
     private enum class PackageClass { WHITELISTED, BLOCKED_ADULT, RISKY, NORMAL }
@@ -40,6 +46,8 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
     private val appListPreferenceListener =
         SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> packageClasses.clear() }
     private val scanInProgress = AtomicBoolean(false)
+    private val isAllWindowsScanRunning = AtomicBoolean(false)
+    private val forceAiScanPackages = ConcurrentHashMap.newKeySet<String>()
 
     /**
      * Watches ENABLED_ACCESSIBILITY_SERVICES for external changes (e.g. Recents bypass).
@@ -47,42 +55,16 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
      * This fires even while the Recents overlay is on top, covering the gap that the
      * per-event tamper guard cannot see.
      */
-    private val accessibilitySettingsObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
-        override fun onChange(selfChange: Boolean, uri: Uri?) {
-            val context = applicationContext
-            val now = System.currentTimeMillis()
-            if (!DnsPreferences.isActive(context) ||
-                now >= DnsPreferences.getExpiryMillis(context)) return
-            if (BankingAccessibilityPause.isIntentionalPauseActive(context, now)) return
 
-            if (!BankingAccessibilityPause.isAccessibilityEnabled(context)) {
-                AppLogger.log(
-                    context,
-                    "[SELF_RESTORE] Accessibility service removed externally (Recents bypass?); restoring.",
-                    TAG, "W"
-                )
-                Log.w(TAG, "Accessibility removed externally - restoring immediately")
-                if (!BankingAccessibilityPause.ensureServiceEnabled(context)) {
-                    AppLogger.log(
-                        context,
-                        "[SELF_RESTORE_FAILED] Could not re-enable Accessibility service",
-                        TAG,
-                        "E"
-                    )
-                }
-            }
-        }
-    }
-    @Volatile
-    private var accessibilitySettingsObserverRegistered = false
 
     private val powerManager by lazy { getSystemService(Context.POWER_SERVICE) as? PowerManager }
     private val NORMAL_SCAN_COOLDOWN = 2000L
     private val AGGRESSIVE_SCAN_COOLDOWN = 500L
     private val MEDIUM_SCAN_COOLDOWN = 1000L
-    private val NORMAL_AI_COOLDOWN = 3000L
-    private val AGGRESSIVE_AI_COOLDOWN = 1000L
-    private val MEDIUM_AI_COOLDOWN = 2000L
+    private val NORMAL_AI_COOLDOWN = 5000L
+    private val AGGRESSIVE_AI_COOLDOWN = 2000L
+    private val MEDIUM_AI_COOLDOWN = 2500L
+    private val UNCHANGED_BENIGN_AI_COOLDOWN = 7000L
     private val AGGRESSIVE_WINDOW = 15 * 60 * 1000L
     private val HOT_AGGRESSIVE_WINDOW = 2 * 60 * 1000L
     private val MEDIUM_AGGRESSIVE_WINDOW = 7 * 60 * 1000L
@@ -93,7 +75,7 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
     private var lastPipDismissScanTime = 0L
 
     private lateinit var smartDetector: SmartContentDetector
-    private val serviceScope = CoroutineScope(Dispatchers.Default + Job())
+    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     private val actionRegex = Regex("(force stop|deactivate|clear storage|clear data|turn off|disable|device admin|accessibility|uninstall)", setOf(RegexOption.IGNORE_CASE))
     // Matches the real package ID, the full app label, or just "Family" (word-bounded),
@@ -146,7 +128,6 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         // Set true to log "would block" verdicts without acting, for tuning false positives.
         private const val DRY_RUN = false
 
-        private const val EVENT_THROTTLE_MS = 50L
         private const val CONFIRM_DELAY_MS = 700L
         private const val AGGRESSIVE_REARM_CONFIDENCE = 0.95f
 
@@ -179,27 +160,55 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         Log.d(TAG, "Smart AI detector initialized")
     }
 
+    private var lastAllWindowsScanTime = 0L
+    private val scanRequests = Channel<String>(Channel.CONFLATED)
+    private var scanWorkerJob: Job? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var stallRunnable: Runnable? = null
+    private var hasWarnedMissingUsageAccess = false
+
     override fun onServiceConnected() {
         super.onServiceConnected()
-        // Filtering in the framework is cheaper than discarding unwanted events in our callback.
         serviceInfo?.let { info ->
             info.eventTypes = RELEVANT_EVENT_TYPES
-            info.notificationTimeout = EVENT_THROTTLE_MS
+            info.notificationTimeout = 250L
             serviceInfo = info
         }
-        if (!accessibilitySettingsObserverRegistered) {
-            contentResolver.registerContentObserver(
-                Settings.Secure.getUriFor(Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES),
-                false,
-                accessibilitySettingsObserver
-            )
-            contentResolver.registerContentObserver(
-                Settings.Secure.getUriFor(Settings.Secure.ACCESSIBILITY_ENABLED),
-                false,
-                accessibilitySettingsObserver
-            )
-            accessibilitySettingsObserverRegistered = true
+
+        // Main thread stall detector (diagnostic tool, disabled in production)
+        if (VERBOSE) {
+            stallRunnable?.let { mainHandler.removeCallbacks(it) }
+            var lastTick = SystemClock.elapsedRealtime()
+            val runnable = object : Runnable {
+                override fun run() {
+                    val now = SystemClock.elapsedRealtime()
+                    if (now - lastTick > 3000) {
+                        AppLogger.log(applicationContext, "[MAIN_STALL] Main thread stalled for ${now - lastTick}ms", TAG, "E")
+                        Log.e(TAG, "Main thread stalled for ${now - lastTick}ms")
+                    }
+                    lastTick = now
+                    mainHandler.postDelayed(this, 1000)
+                }
+            }
+            stallRunnable = runnable
+            mainHandler.post(runnable)
         }
+
+        // Single background worker loop for processing scan requests
+        scanWorkerJob?.cancel()
+        scanWorkerJob = serviceScope.launch {
+            for (pkg in scanRequests) {
+                try {
+                    processEvent(pkg, pkg in forceAiScanPackages)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Background event processing error for $pkg", t)
+                }
+                delay(300L)
+            }
+        }
+
         Log.i(TAG, "Accessibility service connected; app and keyword monitoring is active")
         AppLogger.log(
             applicationContext,
@@ -294,79 +303,162 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         setOf(RegexOption.IGNORE_CASE)
     )
 
-    private fun isBankingOrFinancialApp(pkgName: String): Boolean {
+    private val emergencyDialerPackages = setOf(
+        "com.android.dialer", "com.google.android.dialer", "com.samsung.android.incallui",
+        "com.android.phone", "com.samsung.android.dialer", "com.vivo.daemon.socrates",
+        "com.apple.movetoios", "com.android.server.telecom"
+    )
+
+    private fun isEmergencyDialer(pkgName: String): Boolean {
         if (pkgName.isEmpty()) return false
-        val lowerPkg = pkgName.lowercase()
-        return lowerPkg.contains("bank") ||
-            lowerPkg.contains("paytm") ||
-            lowerPkg.contains("phonepe") ||
-            lowerPkg.contains("paisa") ||
-            lowerPkg.contains("upi") ||
-            lowerPkg.contains("wallet") ||
-            lowerPkg.contains("financial") ||
-            lowerPkg.contains("sbi") ||
-            lowerPkg.contains("hdfc") ||
-            lowerPkg.contains("icici") ||
-            lowerPkg.contains("axis") ||
-            lowerPkg.contains("kotak") ||
-            lowerPkg.contains("baroda") ||
-            lowerPkg.contains("paypal") ||
-            lowerPkg.contains("revolut") ||
-            lowerPkg.contains("chase") ||
-            lowerPkg.contains("wellsfargo") ||
-            lowerPkg.contains("citibank")
+        val lower = pkgName.lowercase()
+        return lower in emergencyDialerPackages || lower.contains("dialer") || lower.contains("incallui")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         if ((event.eventType and RELEVANT_EVENT_TYPES) == 0) return
-
-        // Nothing on screen to police while the device is asleep.
         if (powerManager?.isInteractive == false) return
 
-        val context = applicationContext
         val pkgName = event.packageName?.toString() ?: ""
+        if (pkgName.isEmpty()) return
 
-        dismissLockedPictureInPicture()
+        val now = System.currentTimeMillis()
+        val isLockActive = DnsPreferences.isActive(applicationContext) &&
+            now < DnsPreferences.getExpiryMillis(applicationContext)
+        val hasLockedWindowTargets = tempLockedApps.isNotEmpty() || pipDismissTargets.isNotEmpty()
+        val isWindowBoundaryEvent =
+            event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED ||
+                event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        val isSystemWindowSource = pkgName.contains("launcher", ignoreCase = true) ||
+            pkgName.contains("systemui", ignoreCase = true)
+        val shouldScanAllWindows = (isLockActive || hasLockedWindowTargets) &&
+            (isWindowBoundaryEvent || isSystemWindowSource) &&
+            now - lastAllWindowsScanTime > 700L &&
+            isAllWindowsScanRunning.compareAndSet(false, true)
+        if (shouldScanAllWindows) {
+            lastAllWindowsScanTime = now
+            serviceScope.launch(Dispatchers.IO) {
+                try {
+                    if (tempLockedApps.isNotEmpty() || pipDismissTargets.isNotEmpty()) {
+                        dismissLockedPictureInPicture()
+                        checkAllWindowsForLockedApps()
+                    }
 
-        // Completely ignore banking, payment, and financial apps
-        if (isBankingOrFinancialApp(pkgName)) return
+                    val context = applicationContext
+                    val lockStillActive = DnsPreferences.isActive(context) &&
+                        System.currentTimeMillis() < DnsPreferences.getExpiryMillis(context)
+                    val isIntentionalAccessibilityPause =
+                        BankingAccessibilityPause.isIntentionalPauseActive(context)
+                    val isDeviceAdminLocal = FamilyDeviceAdminReceiver.isDeviceAdmin(context)
 
+                    if (lockStillActive && isDeviceAdminLocal && !isIntentionalAccessibilityPause) {
+                        checkAllWindowsForTampering(true)
+                    }
+                } finally {
+                    isAllWindowsScanRunning.set(false)
+                }
+            }
+        }
+
+        // Use the event source package directly; the active root can still be the launcher during launch.
+        val bankingForegroundPackage = pkgName.takeIf {
+            BankingAccessibilityPause.isBankingOrFinancialApp(applicationContext, it)
+        }
+        if (bankingForegroundPackage != null) {
+            val usageAccess = BankingAccessibilityPause.hasUsageAccess(applicationContext)
+            if (!usageAccess) {
+                Log.w(TAG, "Banking app detected but Usage Access is not granted; accessibility remains enabled")
+                logBankingDecision(
+                    "detected pkg=$bankingForegroundPackage usageAccess=false pauseStarted=false " +
+                        "serviceStartOk=false disableOk=false reason=usage_access_missing",
+                    "W"
+                )
+                if (!hasWarnedMissingUsageAccess) {
+                    Toast.makeText(
+                        applicationContext,
+                        "Enable Usage Access in Family Protection to use banking apps",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    hasWarnedMissingUsageAccess = true
+                }
+                return
+            }
+            hasWarnedMissingUsageAccess = false
+            val pauseStarted =
+                BankingAccessibilityPause.startAutomaticPause(applicationContext, bankingForegroundPackage)
+            if (!pauseStarted) {
+                logBankingDecision(
+                    "detected pkg=$bankingForegroundPackage usageAccess=true pauseStarted=false " +
+                        "serviceStartOk=false disableOk=false reason=pause_persistence_failed",
+                    "E"
+                )
+                return
+            }
+
+            val serviceStartOk = DnsForegroundService.start(applicationContext)
+            if (!serviceStartOk) {
+                Log.e(TAG, "Cannot start the banking foreground monitor")
+                BankingAccessibilityPause.endAutomaticPause(applicationContext)
+                logBankingDecision(
+                    "detected pkg=$bankingForegroundPackage usageAccess=true pauseStarted=true " +
+                        "serviceStartOk=false disableOk=false reason=monitor_start_failed",
+                    "E"
+                )
+                return
+            }
+
+            val disableOk = BankingAccessibilityPause.disableServiceInSettings(applicationContext)
+            logBankingDecision(
+                "detected pkg=$bankingForegroundPackage usageAccess=true pauseStarted=true " +
+                    "serviceStartOk=true disableOk=$disableOk" +
+                    if (disableOk) "" else " reason=service_disable_failed",
+                if (disableOk) "I" else "E"
+            )
+            if (!disableOk) {
+                Log.e(TAG, "Could not pause accessibility for foreground banking app")
+                BankingAccessibilityPause.endAutomaticPause(applicationContext)
+                if (!DnsPreferences.isActive(applicationContext)) {
+                    DnsForegroundService.stop(applicationContext)
+                }
+            }
+            return
+        }
+        hasWarnedMissingUsageAccess = false
+
+        // 2. Early Filter for Emergency Dialers & Whitelisted Packages
+        if (isEmergencyDialer(pkgName)) return
+        val pkgClass = classify(pkgName)
+        if (pkgClass == PackageClass.WHITELISTED) return
+
+        // 3. Queue scan request
+        if (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+            forceAiScanPackages.add(pkgName)
+        }
+        scanRequests.trySend(pkgName)
+    }
+
+    private fun logBankingDecision(message: String, level: String) {
+        AppLogger.log(applicationContext, "[BANKING] $message", TAG, level)
+    }
+
+    private suspend fun processEvent(pkgName: String, forceAiScan: Boolean) {
+        val context = applicationContext
         val eventTime = System.currentTimeMillis()
-        val isDnsLockActive = DnsPreferences.isActive(context) &&
-            eventTime < DnsPreferences.getExpiryMillis(context)
-        val isIntentionalAccessibilityPause =
-            BankingAccessibilityPause.isIntentionalPauseActive(context, eventTime)
+        val isDnsLockActive = DnsPreferences.isActive(context) && eventTime < DnsPreferences.getExpiryMillis(context)
 
-        // ── All-Windows Tamper Scan (covers Recents-overlay bypass) ─────────────────────────────
-        // Run on every event so that a Settings window sitting *below* the Recents overlay is
-        // caught even when the event's packageName belongs to the launcher.
+        // Uninstall & Settings Tamper Checks
         val isDeviceAdminLocal = FamilyDeviceAdminReceiver.isDeviceAdmin(context)
-        checkAllWindowsForTampering(
-            isDeviceAdminLocal && isDnsLockActive && !isIntentionalAccessibilityPause
-        )
-
-        // ── Hard Uninstall Block ─────────────────────────────────────────────────
-        // Only needed when Device Owner is NOT set.
-        // When Device Owner (ADB-level) IS active, setUninstallBlocked() already makes uninstall
-        // impossible at the system level with no accessibility overhead — skip this entire guard.
         val isDeviceOwner = FamilyDeviceAdminReceiver.isDeviceOwner(context)
-        // isDeviceAdminLocal already computed above for the all-windows scan; reuse it here.
-        val isDeviceAdmin = isDeviceAdminLocal
 
-        if (!isDeviceOwner && isDeviceAdmin) {
-            // ── 1. Package Installer / Settings uninstall confirmation dialog ────
+        if (!isDeviceOwner && isDeviceAdminLocal) {
             if (isPackageInstallerUi(pkgName) || isSystemSettingsUi(pkgName)) {
                 val rootNode = rootInActiveWindow
                 if (rootNode != null) {
                     val textList = mutableListOf<String>()
                     extractText(rootNode, textList, 0, 50)
                     val combinedText = textList.joinToString(" ").lowercase()
-
-                    val isUninstallDialog = uninstallConfirmRegex.containsMatchIn(combinedText)
-                    val isOurApp = familyRegex.containsMatchIn(combinedText)
-
-                    if (isUninstallDialog && isOurApp) {
+                    if (uninstallConfirmRegex.containsMatchIn(combinedText) && familyRegex.containsMatchIn(combinedText)) {
                         Log.w(TAG, "BLOCKED: Uninstall confirmation dialog for our app via $pkgName")
                         AppLogger.log(context, "[UNINSTALL_BLOCK] pkg=$pkgName | source=dialog | action=2xBACK+HOME", "AntiUninstallService", "E")
                         dismissTamperingScreen()
@@ -375,35 +467,23 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // ── 2. Launcher long-press drag-to-Uninstall drop zone ───────────────
-            // When a user long-presses our app icon and drags it to the "Uninstall" zone,
-            // the launcher emits accessibility events showing "Uninstall" and our app label.
             if (isLauncherUi(pkgName)) {
                 val rootNode = rootInActiveWindow
                 if (rootNode != null) {
                     val textList = mutableListOf<String>()
                     extractText(rootNode, textList, 0, 50)
                     val combinedText = textList.joinToString(" ").lowercase()
-
-                    val isDragToUninstall = launcherUninstallRegex.containsMatchIn(combinedText)
-                    val isOurApp = familyRegex.containsMatchIn(combinedText)
-
-                    if (isDragToUninstall && isOurApp) {
+                    if (launcherUninstallRegex.containsMatchIn(combinedText) && familyRegex.containsMatchIn(combinedText)) {
                         Log.w(TAG, "BLOCKED: Launcher drag-to-uninstall detected for our app via $pkgName")
-                        AppLogger.log(context, "[UNINSTALL_BLOCK] pkg=$pkgName | source=launcher-drag | action=HOME", "AntiUninstallService", "E")
-                        performGlobalAction(GLOBAL_ACTION_HOME)
-                        Handler(Looper.getMainLooper()).postDelayed({
-                            performGlobalAction(GLOBAL_ACTION_HOME)
-                        }, 300L)
+                        AppLogger.log(context, "[UNINSTALL_BLOCK] pkg=$pkgName | source=launcher-drag | action=LOCK", "AntiUninstallService", "E")
+                        lockDeviceScreen()
                         return
                     }
                 }
             }
         }
 
-        // ── Settings Tamper Guard (Force-Stop / Disable / Clear Data / Accessibility Off) ────────────
-        // Active when Device Admin / Owner or Lock is enabled.
-        if (isDeviceAdmin && isSystemSettingsUi(pkgName)) {
+        if (isDeviceAdminLocal && isSystemSettingsUi(pkgName)) {
             val rootNode = rootInActiveWindow
             if (rootNode != null && isSettingsTargetingOurApp(rootNode)) {
                 Log.w(TAG, "BLOCKED: Settings tampering detected specifically targeting our app - $pkgName")
@@ -413,159 +493,113 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
             }
         }
 
-        // ── App & Keyword Blocking (only during an active DNS schedule) ──
-        val currentTime = eventTime
-        // Reaching this callback means Android has connected and enabled this service.
-        // Do not re-check ENABLED_ACCESSIBILITY_SERVICES here: OEMs can update that setting
-        // asynchronously, which incorrectly caused a connected service to ignore all events.
         if (!isDnsLockActive) return
+        if (eventTime < DnsPreferences.getContentScanPauseUntil(context)) return
 
-        // An Accessibility pause is enforced by disabling this service. If the user manually
-        // re-enables it during the timer, resume enforcement immediately; only the explicit
-        // content-scan pause should suppress checks while the service is running.
-        if (currentTime < DnsPreferences.getContentScanPauseUntil(context)) {
-            return
-        }
-
-        // 0. Classify app dynamically (never block launchers, system UI, or whitelisted apps)
         val pkgClass = classify(pkgName)
         if (pkgClass == PackageClass.WHITELISTED) return
 
+        var currentScreenHash: Int? = null
         if (pkgClass == PackageClass.RISKY) {
-            val rootNode = rootInActiveWindow
-            if (rootNode != null && rootNode.packageName?.toString() == pkgName) {
-                val visibleText = mutableListOf<String>()
-                extractText(rootNode, visibleText, 0, 120)
+            val rootNode = findRootForPackage(pkgName)
+            if (rootNode != null) {
+                val screenData = extractScreenData(rootNode, maxNodes = 120)
+                currentScreenHash = screenData.contentHash
                 val matchedKeyword = KeywordPreferences.findHardKeyword(
                     context,
-                    visibleText.joinToString(" ")
+                    screenData.visibleText.joinToString(" ")
                 )
                 if (matchedKeyword != null) {
                     val appName = SmsSender.resolveAppName(context, pkgName)
                     AppLogger.log(
                         context,
-                        "[KEYWORD_BLOCK] app=$appName | pkg=$pkgName | keyword=\"$matchedKeyword\" | action=HOME | timedLockout=false",
+                        "[KEYWORD_BLOCK] app=$appName | pkg=$pkgName | keyword=\"$matchedKeyword\" | action=LOCK | timedLockout=false",
                         TAG,
                         "E"
                     )
-                    pipDismissTargets[pkgName] = currentTime + 60_000L
+                    pipDismissTargets[pkgName] = eventTime + 60_000L
                     Log.w(TAG, "Keyword block: app=$appName pkg=$pkgName keyword=\"$matchedKeyword\"")
-                    performGlobalAction(GLOBAL_ACTION_HOME)
-                    Handler(Looper.getMainLooper()).postDelayed({
-                        dismissLockedPictureInPicture(force = true)
-                    }, 400L)
-                    Handler(Looper.getMainLooper()).postDelayed({
-                        if (rootInActiveWindow?.packageName?.toString() == pkgName) {
-                            performGlobalAction(GLOBAL_ACTION_HOME)
-                        }
-                    }, 250L)
+                    lockDeviceScreen()
                     return
                 }
             }
         }
 
-        // 1. Enforce custom/adult blocked apps (e.g. com.facebook.katana, Bumble, Tinder)
         if (pkgClass == PackageClass.BLOCKED_ADULT) {
             val appName = SmsSender.resolveAppName(context, pkgName)
             Log.w(TAG, "BLOCKED: Adult/custom blocked app launch - $appName ($pkgName)")
             AppLogger.log(
                 context,
-                "[APP_BLOCK] app=$appName | pkg=$pkgName | rule=immediate_block_list | action=HOME | timedLockout=5m",
+                "[APP_BLOCK] app=$appName | pkg=$pkgName | rule=immediate_block_list | action=LOCK | timedLockout=5m",
                 "AntiUninstallService",
                 "E"
             )
             tempLockedApps[pkgName] = System.currentTimeMillis() + LOCKOUT_DURATION_MS
             pipDismissTargets[pkgName] = tempLockedApps[pkgName] ?: 0L
-            performGlobalAction(GLOBAL_ACTION_HOME)
-            Handler(Looper.getMainLooper()).postDelayed({
-                dismissLockedPictureInPicture(force = true)
-            }, 400L)
-            Handler(Looper.getMainLooper()).post {
-                Toast.makeText(context, "⛔ Blocked app ($pkgName)", Toast.LENGTH_LONG).show()
-            }
-            SmsSender.sendBlockedAppAlert(
-                context,
-                SmsSender.resolveAppName(context, pkgName),
-                pkgName
-            )
+            lockDeviceScreen()
             return
         }
 
-        // The AI content detector is also tied to the DNS schedule.
-        if (!isDnsLockActive) return
-
-        // 5-minute lockout check: If this app was thrown away for a violation, block it from opening for 5 minutes
         if (pkgName.isNotBlank()) {
             val lockoutUntil = tempLockedApps[pkgName]
             if (lockoutUntil != null) {
                 val remainingMs = lockoutUntil - System.currentTimeMillis()
                 if (remainingMs > 0) {
-                    val remainingMin = (remainingMs / 1000) / 60
-                    val remainingSec = (remainingMs / 1000) % 60
-                    Log.w(TAG, "Found video .LOCKED APP LAUNCH BLOCKED: $pkgName (Remaining: ${remainingMin}m ${remainingSec}s)")
-                    performGlobalAction(GLOBAL_ACTION_HOME)
-                    Handler(Looper.getMainLooper()).post {
-                        Toast.makeText(
-                            context,
-                            "⛔ App locked for ${remainingMin}m ${remainingSec}s due to violation",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
+                    Log.w(TAG, "LOCKED APP LAUNCH BLOCKED: $pkgName")
+                    lockDeviceScreen()
                     return
                 } else {
-                    // Lockout duration expired: remove and resume normal/aggressive checks
                     tempLockedApps.remove(pkgName)
-                    Log.d(TAG, "5-min lockout expired for $pkgName. Resuming monitoring.")
-                    AppLogger.log(context, "[EXPIRY] Lockout expired for $pkgName | resumed monitoring", "AntiUninstallService", "I")
                 }
             }
         }
 
         val scanState = appScanStates.getOrPut(pkgName) { AppScanState() }
-        val elapsedSinceBlock = currentTime - scanState.lastBlockedTime
+        val elapsedSinceBlock = eventTime - scanState.lastBlockedTime
         val scanCooldown = getScanCooldown(elapsedSinceBlock)
-        if (currentTime - scanState.lastScanTime < scanCooldown) return
-        scanState.lastScanTime = currentTime
+        if (!forceAiScan && eventTime - scanState.lastScanTime < scanCooldown) return
+        if (forceAiScan && eventTime - scanState.lastAiScanTime < NORMAL_AI_COOLDOWN) return
+        scanState.lastScanTime = eventTime
 
-        // AI-powered adult content detection (only for browsers/social media)
-        if (pkgClass != PackageClass.RISKY) return
-        if (currentTime < DnsPreferences.getContentScanPauseUntil(context)) return
+        if (pkgClass != PackageClass.RISKY) {
+            forceAiScanPackages.remove(pkgName)
+            return
+        }
 
-        val aiCooldown = getAiCooldown(elapsedSinceBlock)
-        if (currentTime - scanState.lastAiScanTime > aiCooldown &&
+        val currentRoot = findRootForPackage(pkgName) ?: return
+        val contentHash = currentScreenHash ?: extractScreenData(currentRoot, maxNodes = 120).contentHash
+        val contentChanged = scanState.lastContentHash != contentHash
+        val aiCooldown = if (!contentChanged && scanState.lastContentWasBenign && !forceAiScan) {
+            UNCHANGED_BENIGN_AI_COOLDOWN
+        } else {
+            getAiCooldown(elapsedSinceBlock)
+        }
+        if (eventTime - scanState.lastAiScanTime > aiCooldown &&
             scanInProgress.compareAndSet(false, true)
         ) {
-            scanState.lastAiScanTime = currentTime
-            
-            if (VERBOSE) Log.d(TAG, "Starting AI detection for: $pkgName")
-            
-            serviceScope.launch {
-                try {
-                    val currentRoot = rootInActiveWindow ?: return@launch
-                    if (currentRoot.packageName?.toString() != pkgName) {
-                        if (VERBOSE) Log.d(TAG, "Foreground changed before analysis; skipping")
-                        return@launch
-                    }
+            scanState.lastAiScanTime = eventTime
+            if (forceAiScan) forceAiScanPackages.remove(pkgName)
+            try {
+                val capture: suspend () -> Bitmap? = {
+                    if (findRootForPackage(pkgName) != null) captureScreenshot() else null
+                }
 
-                    // Screenshot is captured only if the detector actually needs pixels or OCR.
-                    val capture: suspend () -> Bitmap? = {
-                        if (rootInActiveWindow?.packageName?.toString() == pkgName) captureScreenshot() else null
-                    }
-
-                    val result = smartDetector.analyzeContent(pkgName, currentRoot, capture)
+                val result = smartDetector.analyzeContent(pkgName, currentRoot, capture, forceAiScan)
+                scanState.lastContentHash = contentHash
+                scanState.lastContentWasBenign = !result.isBlocked && result.method != "error"
                     if (!result.isBlocked) {
                         if (VERBOSE) Log.d(TAG, "Content allowed: $pkgName - ${result.reason}")
-                        return@launch
+                        return
                     }
 
                     // Half-loaded pages cause most false positives, so score twice before acting.
                     if (result.method != "explicit") {
                         delay(CONFIRM_DELAY_MS)
-                        val confirmRoot = rootInActiveWindow ?: return@launch
-                        if (confirmRoot.packageName?.toString() != pkgName) return@launch
-                        if (!smartDetector.analyzeContent(pkgName, confirmRoot, capture).isBlocked) {
+                        val confirmRoot = rootInActiveWindow ?: return
+                        if (confirmRoot.packageName?.toString() != pkgName) return
+                        if (!smartDetector.analyzeContent(pkgName, confirmRoot, capture, true).isBlocked) {
                             Log.w(TAG, "Unconfirmed block ignored for $pkgName - ${result.reason}")
-                            return@launch
+                            return
                         }
                     }
 
@@ -593,22 +627,26 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
                 }
             }
         }
-    }
 
     private fun blockCurrentApp(pkgName: String, reason: String) {
+        if (pkgName == applicationContext.packageName || pkgName.contains("launcher", ignoreCase = true) || isEmergencyDialer(pkgName)) return
         val lockoutUntil = System.currentTimeMillis() + LOCKOUT_DURATION_MS
         tempLockedApps[pkgName] = lockoutUntil
         pipDismissTargets[pkgName] = lockoutUntil
         val appName = SmsSender.resolveAppName(applicationContext, pkgName)
         AppLogger.log(
             applicationContext,
-            "[CONTENT_BLOCK] app=$appName | pkg=$pkgName | reason=$reason | action=HOME | timedLockout=5m",
+            "[CONTENT_BLOCK] app=$appName | pkg=$pkgName | reason=$reason | action=LOCK | timedLockout=5m",
             "AntiUninstallService",
             "E"
         )
 
-        val actionAccepted = performGlobalAction(GLOBAL_ACTION_HOME)
-        Log.w(TAG, "Home action accepted=$actionAccepted, reason=$reason, app locked for 5m: $pkgName")
+        lockDeviceScreen()
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(applicationContext, "⛔ Blocked ($reason)", Toast.LENGTH_LONG).show()
+        }
+        SmsSender.sendBlockedAppAlert(applicationContext, appName, pkgName)
+        Log.w(TAG, "Screen locked due to content violation, reason=$reason, app locked for 5m: $pkgName")
         Handler(Looper.getMainLooper()).postDelayed({
             dismissLockedPictureInPicture(force = true)
         }, 400L)
@@ -616,8 +654,8 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
             val foregroundPackage = rootInActiveWindow?.packageName?.toString()
             if (foregroundPackage == pkgName || (foregroundPackage != null &&
                 (browserApps.contains(foregroundPackage) || socialMediaApps.contains(foregroundPackage)))) {
-                Log.w(TAG, "Foreground still blocked app: $foregroundPackage; retrying Home")
-                performGlobalAction(GLOBAL_ACTION_HOME)
+                Log.w(TAG, "Foreground still blocked app: $foregroundPackage; retrying Lock")
+                lockDeviceScreen()
             }
         }, 250L)
     }
@@ -744,6 +782,7 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
                                 screenshotResult.colorSpace
                             )
                             val bitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+                            hardwareBitmap?.recycle()
                             screenshotResult.hardwareBuffer.close()
                             Log.d(TAG, "Screenshot captured successfully")
                             if (continuation.isActive) continuation.resume(bitmap)
@@ -779,20 +818,26 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
      * This ensures that reopening Overview/Recents will NOT resume directly onto the toggle switch.
      */
     private fun dismissTamperingScreen() {
-        performGlobalAction(GLOBAL_ACTION_BACK)
-        performGlobalAction(GLOBAL_ACTION_BACK)
-        performGlobalAction(GLOBAL_ACTION_BACK)
-        performGlobalAction(GLOBAL_ACTION_HOME)
-        Handler(Looper.getMainLooper()).postDelayed({
-            val currentRoot = rootInActiveWindow
-            val currentPkg = currentRoot?.packageName?.toString() ?: ""
-            if (isSystemSettingsUi(currentPkg) || isPackageInstallerUi(currentPkg)) {
+        VigilanceManager.recordViolation(applicationContext, "Settings tampering dismissed")
+        mainHandler.post {
+            // Step 1: 1st Back
+            performGlobalAction(GLOBAL_ACTION_BACK)
+
+            mainHandler.postDelayed({
+                // Step 2: 2nd Back
                 performGlobalAction(GLOBAL_ACTION_BACK)
-                performGlobalAction(GLOBAL_ACTION_BACK)
-                performGlobalAction(GLOBAL_ACTION_BACK)
-                performGlobalAction(GLOBAL_ACTION_HOME)
-            }
-        }, 150L)
+
+                mainHandler.postDelayed({
+                    // Step 3: 3rd Back
+                    performGlobalAction(GLOBAL_ACTION_BACK)
+
+                    mainHandler.postDelayed({
+                        // Step 4: Home
+                        performGlobalAction(GLOBAL_ACTION_HOME)
+                    }, 120L)
+                }, 120L)
+            }, 120L)
+        }
     }
 
     /**
@@ -815,6 +860,24 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
                     TAG, "W"
                 )
                 dismissTamperingScreen()
+                return
+            }
+        }
+    }
+
+    private fun checkAllWindowsForLockedApps() {
+        val now = System.currentTimeMillis()
+        tempLockedApps.entries.removeIf { it.value <= now }
+        if (tempLockedApps.isEmpty()) return
+
+        val currentWindows = windows ?: return
+        for (window in currentWindows) {
+            val root = window.root ?: continue
+            val pkg = root.packageName?.toString() ?: continue
+            if (pkg == applicationContext.packageName || pkg.contains("launcher", ignoreCase = true)) continue
+            if (tempLockedApps.containsKey(pkg)) {
+                Log.w(TAG, "BLOCKED (all-windows lockout scan): Locked app card/window detected in Recents/screen - $pkg")
+                lockDeviceScreen()
                 return
             }
         }
@@ -846,6 +909,16 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
             combinedText.contains("turn off app")
 
         if (hasDestructiveAction) return true
+
+        // 1.1 Battery optimization / restriction tampering
+        val hasBatteryTampering = combinedText.contains("battery") &&
+            (combinedText.contains("restricted") ||
+             combinedText.contains("restrict") ||
+             combinedText.contains("optimize") ||
+             combinedText.contains("optimization") ||
+             combinedText.contains("background"))
+
+        if (hasBatteryTampering) return true
 
         // 2. Specific toggle page or confirmation dialog for Family Protection Accessibility
         // Standard Android strings on the dedicated toggle screen for a service:
@@ -893,7 +966,21 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
         return false
     }
 
-    private fun extractText(node: AccessibilityNodeInfo, textList: MutableList<String>, depth: Int, maxNodes: Int) {
+    private fun findRootForPackage(targetPkg: String): AccessibilityNodeInfo? {
+        val activeRoot = rootInActiveWindow
+        if (activeRoot != null && activeRoot.packageName?.toString() == targetPkg) return activeRoot
+
+        val currentWindows = windows ?: return activeRoot
+        for (window in currentWindows) {
+            val windowRoot = window.root ?: continue
+            if (windowRoot.packageName?.toString() == targetPkg) {
+                return windowRoot
+            }
+        }
+        return activeRoot
+    }
+
+    private fun extractText(node: AccessibilityNodeInfo, textList: MutableList<String>, depth: Int, maxNodes: Int = 60) {
         if (textList.size >= maxNodes || depth > 5) return
         
         node.text?.toString()?.let { if (it.isNotBlank()) textList.add(it) }
@@ -904,12 +991,68 @@ class AntiUninstallAccessibilityService : AccessibilityService() {
             node.getChild(i)?.let { extractText(it, textList, depth + 1, maxNodes) }
         }
     }
+
+    private data class ExtractedScreenData(
+        val visibleText: List<String>,
+        val contentHash: Int
+    )
+
+    private fun extractScreenData(rootNode: AccessibilityNodeInfo, maxNodes: Int = 120): ExtractedScreenData {
+        val visibleText = ArrayList<String>(maxNodes)
+        extractText(rootNode, visibleText, 0, maxNodes = maxNodes)
+        val contentHash = visibleText.joinToString("\u001F").hashCode()
+        return ExtractedScreenData(visibleText, contentHash)
+    }
     
+    private fun lockDeviceScreen() {
+        VigilanceManager.recordViolation(applicationContext, "Tamper / Content violation triggered")
+        mainHandler.post {
+            // Step 1: 1st Back press (0ms)
+            performGlobalAction(GLOBAL_ACTION_BACK)
+
+            mainHandler.postDelayed({
+                // Step 2: 2nd Back press (120ms)
+                performGlobalAction(GLOBAL_ACTION_BACK)
+
+                mainHandler.postDelayed({
+                    // Step 3: Home action (240ms)
+                    performGlobalAction(GLOBAL_ACTION_HOME)
+
+                    mainHandler.postDelayed({
+                        // Step 4: Screen Lock (360ms)
+                        val dpmService = getSystemService(DEVICE_POLICY_SERVICE) as? DevicePolicyManager
+                        val lockedByDeviceOwner = if (
+                            dpmService != null && FamilyDeviceAdminReceiver.isDeviceOwner(applicationContext)
+                        ) {
+                            try {
+                                dpmService.lockNow()
+                                true
+                            } catch (e: SecurityException) {
+                                Log.e(TAG, "Device owner cannot lock the screen; using accessibility action", e)
+                                false
+                            }
+                        } else {
+                            false
+                        }
+
+                        if (!lockedByDeviceOwner) {
+                            val lockedByAccessibility = performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
+                            if (!lockedByAccessibility) {
+                                Log.e(TAG, "Could not lock screen after handling violation")
+                            }
+                        }
+                    }, 120L)
+                }, 120L)
+            }, 120L)
+        }
+    }
+
     override fun onInterrupt() {}
     
     override fun onDestroy() {
-        // A restarted service begins in normal scan mode; the aggressive window is session-only.
-        contentResolver.unregisterContentObserver(accessibilitySettingsObserver)
+        stallRunnable?.let { mainHandler.removeCallbacks(it) }
+        scanWorkerJob?.cancel()
+        AccessibilityGuard.heal(applicationContext, "onDestroy")
         serviceScope.cancel()
         appScanStates.clear()
         appListPreferences?.unregisterOnSharedPreferenceChangeListener(appListPreferenceListener)

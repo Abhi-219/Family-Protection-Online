@@ -44,10 +44,10 @@ class FamilyDeviceAdminReceiver : DeviceAdminReceiver() {
                     dpm.clearUserRestriction(component, UserManager.DISALLOW_UNINSTALL_APPS)
                     // This affects only context.packageName.
                     dpm.setUninstallBlocked(component, context.packageName, blocked)
-                    if (!blocked) {
-                        dpm.clearDeviceOwnerApp(context.packageName)
-                    }
-                    Log.d(TAG, "Family app uninstall blocked=$blocked; other apps remain uninstallable")
+                    try {
+                        dpm.setUserControlDisabledPackages(component, if (blocked) listOf(context.packageName) else emptyList())
+                    } catch (_: Exception) {}
+                    Log.d(TAG, "Family app uninstall and user control blocked=$blocked")
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to set hardware restrictions", e)
