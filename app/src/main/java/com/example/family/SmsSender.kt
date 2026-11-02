@@ -44,7 +44,7 @@ object SmsSender {
             append("[ALERT] Family Protection Alert\n")
             append("App: $appName\n")
             append("Package: $packageName\n")
-            append("Adult keyword detected: $keyword\n")
+            append("Detected: $keyword\n")
             append("Action: Blocked & screen locked.\n")
 
             val currentTime = LocalDateTime.now()
