@@ -132,7 +132,7 @@ class DnsForegroundService : Service() {
         }
 
         fun updateVigilanceState(context: Context) {
-            instance?.syncVigilanceState() ?: start(context)
+            instance?.syncVigilanceState() ?: run { if (DnsPreferences.isActive(context)) start(context) }
         }
     }
 
@@ -141,6 +141,8 @@ class DnsForegroundService : Service() {
         if (!DnsPreferences.isActive(context)) {
             hyperAlertJob?.cancel()
             VigilanceWatchdogAlarm.cancel(context)
+            // Nothing to guard: no lock and no banking monitor, so don't linger as a sticky service.
+            if (BankingAccessibilityPause.automaticBankingPackage(context) == null) stopSelf()
             return
         }
 
