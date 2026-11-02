@@ -77,12 +77,16 @@ class SmartContentDetector(private val context: Context) {
         val weak: Map<TextPattern, Int>
     )
 
-    private class ScreenText(
+    class ScreenText internal constructor(
         val query: String,
         val suggestions: String,
         val page: String,
         val mightHaveMedia: Boolean
-    )
+    ) {
+        val contentHash: Int = "$query\u001F$suggestions\u001F$page".hashCode()
+        // Excludes autocomplete rows so typing a prefix can't trigger an instant lock.
+        val keywordText: String get() = "$query $page"
+    }
 
     private data class TextAssessment(
         val mainText: String,
@@ -126,8 +130,9 @@ class SmartContentDetector(private val context: Context) {
         private const val SOFT_RED_TEXT_SCORE = 0.6f  // one ambiguous term, enough to pair with an image
 
         // Accessibility view-ID fragments across Chromium, Firefox and Samsung Internet
-        private val URL_BAR_IDS = listOf("url_bar", "url_view", "urlbar", "location_bar_edit_text")
-        private val SUGGESTION_IDS = listOf("suggestion", "omnibox", "awesomebar", "autocomplete", "line_1", "line_2")
+        internal val URL_BAR_IDS = listOf("url_bar", "url_view", "urlbar", "location_bar_edit_text")
+        // Shared with the service's short keyword read so both instant-lock paths ignore autocomplete rows.
+        internal val SUGGESTION_IDS = listOf("suggestion", "omnibox", "awesomebar", "autocomplete", "line_1", "line_2")
 
         // Whole word/phrase; spaces in phrases also match hyphens/multiple spaces; optional plural "s"
         private fun buildRegex(phrase: String, plural: Boolean = true): Regex {
@@ -234,17 +239,21 @@ class SmartContentDetector(private val context: Context) {
         private val WHITELIST_DOMAIN_PATTERNS = WHITELIST_DOMAINS.map { domainRegex(it) }
     }
 
+    /** Reads the screen once so the caller can reuse it for its own checks and pass it to [analyzeContent]. */
+    fun readScreen(root: AccessibilityNodeInfo?): ScreenText = extractScreenText(root)
+
     suspend fun analyzeContent(
         packageName: String,
         rootNode: AccessibilityNodeInfo?,
         screenshotProvider: (suspend () -> Bitmap?)? = null,
-        forceRecheck: Boolean = false
+        forceRecheck: Boolean = false,
+        preRead: ScreenText? = null
     ): DetectionResult = withContext(Dispatchers.Default) {
 
         try {
             // Step 1: Extract text, split by source
-            val screen = extractScreenText(rootNode)
-            val contentHash = "${screen.query}\u001F${screen.suggestions}\u001F${screen.page}".hashCode()
+            val screen = preRead ?: extractScreenText(rootNode)
+            val contentHash = screen.contentHash
             val now = System.currentTimeMillis()
             val cached = benignContentCache[packageName]
             if (!forceRecheck && cached?.contentHash == contentHash &&
@@ -263,43 +272,15 @@ class SmartContentDetector(private val context: Context) {
             var mainText = TextNormalizer.normalize(applyExceptions("$queryText $pageText".trim()))
             hardBlock(mainText)?.let {
                 benignContentCache.remove(packageName)
-                val appName = SmsSender.resolveAppName(context, packageName)
-                val matchedKeywords = it.reason.removePrefix("Red list: ")
-                AppLogger.log(
-                    context,
-                    "[KEYWORD_DETECTION] app=$appName | pkg=$packageName | keywords=$matchedKeywords | reason=${it.reason} | method=${it.method}",
-                    "SmartContentDetector",
-                    "E"
-                )
-                SmsSender.sendKeywordAlert(
-                    context,
-                    SmsSender.resolveAppName(context, packageName),
-                    packageName,
-                    it.reason
-                )
+                // Candidate only: the service logs and alerts after it confirms the block.
+                Log.w(TAG, "[KEYWORD_CANDIDATE] pkg=$packageName | reason=${it.reason} | method=${it.method}")
                 return@withContext it
             }
             var assessment = assessText(packageName, mainText, suggestionText)
             assessment.immediateResult?.let {
                 if (it.isBlocked) {
                     benignContentCache.remove(packageName)
-                    val appName = SmsSender.resolveAppName(context, packageName)
-                    val matchedKeywords = assessment.mainResult.counts
-                        .filterValues { count -> count > 0 }
-                        .keys
-                        .joinToString(", ") { pattern -> pattern.phrase }
-                    AppLogger.log(
-                        context,
-                        "[KEYWORD_DETECTION] app=$appName | pkg=$packageName | keywords=$matchedKeywords | reason=${it.reason} | method=${it.method}",
-                        "SmartContentDetector",
-                        "W"
-                    )
-                    SmsSender.sendKeywordAlert(
-                        context,
-                        SmsSender.resolveAppName(context, packageName),
-                        packageName,
-                        it.reason
-                    )
+                    Log.w(TAG, "[KEYWORD_CANDIDATE] pkg=$packageName | reason=${it.reason} | method=${it.method}")
                 } else {
                     benignContentCache[packageName] = BenignContentCache(contentHash, now)
                 }
@@ -337,21 +318,13 @@ class SmartContentDetector(private val context: Context) {
 
             if (blocked) {
                 benignContentCache.remove(packageName)
-                val appName = SmsSender.resolveAppName(context, packageName)
                 val matchedKeywords = assessment.mainResult.counts
                     .filterValues { count -> count > 0 }
                     .keys
                     .joinToString(", ") { pattern -> pattern.phrase }
                     .ifEmpty { "none (image/content score)" }
-                val logMsg = "[AI_BLOCK] app=$appName | pkg=$packageName | keywords=$matchedKeywords | reason=$reason | confidence=$finalScore | text=${assessment.effectiveTextScore} img=$imageScore"
-                Log.w(TAG, logMsg)
-                AppLogger.log(context, logMsg, "SmartContentDetector", "E")
-                SmsSender.sendKeywordAlert(
-                    context,
-                    SmsSender.resolveAppName(context, packageName),
-                    packageName,
-                    reason ?: "Adult content"
-                )
+                Log.w(TAG, "[AI_CANDIDATE] pkg=$packageName | keywords=$matchedKeywords | reason=$reason | " +
+                    "confidence=$finalScore | text=${assessment.effectiveTextScore} img=$imageScore")
             } else if (VERBOSE_LOGS) {
                 Log.d(TAG, "Result: package=$packageName | text=${assessment.effectiveTextScore} | image=$imageScore | " +
                         "matched=${assessment.mainResult.counts.keys.joinToString { it.phrase }} | blocked=false")
