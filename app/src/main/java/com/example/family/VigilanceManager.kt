@@ -17,6 +17,11 @@ object VigilanceManager {
     private const val TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000L
 
     fun recordViolation(context: Context, reason: String) {
+        // Without a lock, tamper attempts are logged but must not prime the next lock into Hyper-Alert.
+        if (!DnsPreferences.isActive(context)) {
+            AppLogger.log(context, "[VIGILANCE_VIOLATION] Reason: $reason | No active lock; not escalating", TAG, "I")
+            return
+        }
         val now = System.currentTimeMillis()
         DnsPreferences.recordViolationTimestamp(context, now)
         Log.w(TAG, "Security violation recorded ($reason). Escalating to Hyper-Alert!")
