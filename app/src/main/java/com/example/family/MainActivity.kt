@@ -126,6 +126,32 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// Vivo component names differ across Funtouch/OriginOS versions; first one that launches wins.
+fun openBackgroundSurvivalSettings(context: Context) {
+    val pm = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+    val candidates = mutableListOf<Intent>()
+    if (pm?.isIgnoringBatteryOptimizations(context.packageName) == false) {
+        @android.annotation.SuppressLint("BatteryLife")
+        val request = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+            .setData(android.net.Uri.parse("package:${context.packageName}"))
+        candidates += request
+    }
+    candidates += Intent().setClassName("com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity")
+    candidates += Intent().setClassName("com.iqoo.secure", "com.iqoo.secure.ui.phoneoptimize.BgStartUpManager")
+    candidates += Intent().setClassName("com.iqoo.secure", "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity")
+    candidates += Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+        .setData(android.net.Uri.parse("package:${context.packageName}"))
+
+    for (intent in candidates) {
+        try {
+            context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            return
+        } catch (_: Exception) {
+        }
+    }
+    Toast.makeText(context, "Open Settings > Battery and allow Family in background.", Toast.LENGTH_LONG).show()
+}
+
 object DnsPreferences {
     private const val PREF_NAME = "dns_settings"
     private const val KEY_DNS_NAME = "dns_name"
@@ -1866,7 +1892,13 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                     Text("5. Now return here and click 'Open Settings' to enable the Guard service.", fontSize = 13.sp)
 
                     Spacer(modifier = Modifier.height(4.dp))
-                    Text("💡 Tip: Also set Battery to 'Unrestricted' in App Info so the guard never stops.", fontSize = 12.sp, color = Color.Gray)
+                    Text("💡 Vivo: allow Autostart, set Background power to 'Allow high background power consumption', and lock the app in Recents (swipe down on its card).", fontSize = 12.sp, color = Color.Gray)
+                    OutlinedButton(
+                        onClick = { openBackgroundSurvivalSettings(context) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Battery & Autostart settings")
+                    }
                 }
             },
             confirmButton = {
