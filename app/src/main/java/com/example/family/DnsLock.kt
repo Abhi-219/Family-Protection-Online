@@ -9,6 +9,15 @@ object DnsLock {
     private fun dpm(c: Context) = c.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
     private fun admin(c: Context) = FamilyDeviceAdminReceiver.getComponentName(c)
 
+    private val lockRestrictions = listOf(
+        UserManager.DISALLOW_CONFIG_PRIVATE_DNS,
+        UserManager.DISALLOW_CONFIG_VPN,
+        UserManager.DISALLOW_APPS_CONTROL,
+        UserManager.DISALLOW_SAFE_BOOT,
+        UserManager.DISALLOW_CONFIG_DATE_TIME,
+        UserManager.DISALLOW_ADD_USER
+    )
+
     fun lock(c: Context, host: String): Boolean {
         val policyManager = dpm(c)
         val adminComponent = admin(c)
@@ -19,11 +28,7 @@ object DnsLock {
             policyManager.setGlobalSetting(adminComponent, "private_dns_mode", "hostname")
             policyManager.setGlobalSetting(adminComponent, "private_dns_specifier", host)
 
-            listOf(
-                UserManager.DISALLOW_CONFIG_PRIVATE_DNS,
-                UserManager.DISALLOW_CONFIG_VPN,
-                UserManager.DISALLOW_APPS_CONTROL
-            ).forEach { restriction ->
+            lockRestrictions.forEach { restriction ->
                 try {
                     policyManager.addUserRestriction(adminComponent, restriction)
                 } catch (_: Exception) {}
@@ -40,11 +45,7 @@ object DnsLock {
         val adminComponent = admin(c)
         if (!policyManager.isDeviceOwnerApp(c.packageName)) return
 
-        listOf(
-            UserManager.DISALLOW_CONFIG_PRIVATE_DNS,
-            UserManager.DISALLOW_CONFIG_VPN,
-            UserManager.DISALLOW_APPS_CONTROL
-        ).forEach { restriction ->
+        lockRestrictions.forEach { restriction ->
             try {
                 policyManager.clearUserRestriction(adminComponent, restriction)
             } catch (_: Exception) {}
