@@ -1,7 +1,10 @@
 package com.abhi.familyprotection
 
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.net.Uri
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -121,6 +124,20 @@ object AppListPreferences {
 
     fun getAllSupervisedPatterns(context: Context): Set<String> =
         getCustomSupervisedPatterns(context)
+
+    // Generic https handlers catch unlisted/OEM browsers (e.g. com.vivo.browser); app-link-only apps do not match example.com.
+    @Suppress("DEPRECATION")
+    fun isWebBrowser(context: Context, pkgName: String): Boolean {
+        if (DEFAULT_BROWSER_APPS.any { pkgName.contains(it, ignoreCase = true) }) return true
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com"))
+            .addCategory(Intent.CATEGORY_BROWSABLE)
+            .setPackage(pkgName)
+        return try {
+            context.packageManager.queryIntentActivities(intent, PackageManager.MATCH_ALL).isNotEmpty()
+        } catch (_: Exception) {
+            false
+        }
+    }
 
     private val SEGMENT_REGEX = Regex("[A-Za-z0-9_]+")
     private val patternCache = ConcurrentHashMap<String, Regex>()
