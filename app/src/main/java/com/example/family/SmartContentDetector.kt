@@ -77,7 +77,12 @@ class SmartContentDetector(private val context: Context) {
         val weak: Map<TextPattern, Int>
     )
 
-    private class ScreenText(val query: String, val suggestions: String, val page: String)
+    private class ScreenText(
+        val query: String,
+        val suggestions: String,
+        val page: String,
+        val mightHaveMedia: Boolean
+    )
 
     private data class TextAssessment(
         val mainText: String,
@@ -111,7 +116,7 @@ class SmartContentDetector(private val context: Context) {
         private const val LABEL_MIN_CONFIDENCE = 0.9f
         private const val LABELER_SKIP_BELOW = 0.15f  // NSFW model confidently safe -> skip ML Kit labeler
         private const val INTERPRETER_IDLE_CLOSE_MS = 3 * 60 * 1000L
-        private const val MEDIA_SCAN_MAX_NODES = 400
+        private const val MAX_TEXT_NODES = 500
         private const val MIN_NODES_FOR_TRUST = 8
         private const val MEDIA_MIN_SIDE_FRACTION = 0.2f
         private val MEDIA_CLASS_HINTS = listOf("Image", "Video", "Surface", "Texture", "Player")
@@ -307,7 +312,7 @@ class SmartContentDetector(private val context: Context) {
                 if (assessment.effectiveTextScore >= IMAGE_SKIP_TEXT) {
                     0f
                 } else {
-                    screenshot = if (!suggestionsVisible && (rootNode == null || hasVisualMedia(rootNode))) {
+                    screenshot = if (!suggestionsVisible && screen.mightHaveMedia) {
                         screenshotProvider?.invoke()
                     } else {
                         null
@@ -436,16 +441,25 @@ class SmartContentDetector(private val context: Context) {
     }
 
     /** Blanks benign phrases so their substrings can't register as a hit. */
+    @Volatile private var hardRedCache: Pair<Set<String>, List<Pair<String, Regex>>>? = null
+    @Volatile private var exceptionsCache: Pair<Set<String>, List<Regex>>? = null
+
     private fun getCombinedHardRed(): List<Pair<String, Regex>> {
         val custom = KeywordPreferences.getCustomHardKeywords(context)
         if (custom.isEmpty()) return HARD_RED
-        return HARD_RED + custom.map { it to KeywordPreferences.buildRegex(it) }
+        hardRedCache?.let { (key, compiled) -> if (key == custom) return compiled }
+        val compiled = HARD_RED + custom.map { it to KeywordPreferences.buildRegex(it) }
+        hardRedCache = custom.toSet() to compiled
+        return compiled
     }
 
     private fun getCombinedExceptions(): List<Regex> {
         val custom = KeywordPreferences.getCustomExceptions(context)
         if (custom.isEmpty()) return EXCEPTIONS
-        return EXCEPTIONS + custom.map { KeywordPreferences.buildRegex(it) }
+        exceptionsCache?.let { (key, compiled) -> if (key == custom) return compiled }
+        val compiled = EXCEPTIONS + custom.map { KeywordPreferences.buildRegex(it) }
+        exceptionsCache = custom.toSet() to compiled
+        return compiled
     }
 
     /** Blanks benign phrases so their substrings can't register as a hit. */
@@ -678,32 +692,46 @@ class SmartContentDetector(private val context: Context) {
     }
 
     // Screens with no sizeable image/video node have nothing for the image model to find.
-    private fun hasVisualMedia(root: AccessibilityNodeInfo): Boolean {
-        val minSide = (context.resources.displayMetrics.widthPixels * MEDIA_MIN_SIDE_FRACTION).toInt()
-        val rect = Rect()
-        val stack = ArrayDeque<AccessibilityNodeInfo>().apply { addLast(root) }
-        var visited = 0
-        while (stack.isNotEmpty() && visited < MEDIA_SCAN_MAX_NODES) {
-            val node = stack.removeLast()
-            visited++
-            val cls = node.className?.toString().orEmpty()
-            if (MEDIA_CLASS_HINTS.any { cls.contains(it, ignoreCase = true) }) {
-                node.getBoundsInScreen(rect)
-                if (rect.width() >= minSide && rect.height() >= minSide) return true
-            }
-            for (i in 0 until node.childCount) node.getChild(i)?.let(stack::addLast)
-        }
-        // Too few nodes (Flutter/canvas UIs) or tree too large to finish: can't rule media out.
-        return visited < MIN_NODES_FOR_TRUST || stack.isNotEmpty()
+    private fun isMediaNode(node: AccessibilityNodeInfo, minSide: Int, rect: Rect): Boolean {
+        val cls = node.className?.toString().orEmpty()
+        if (MEDIA_CLASS_HINTS.none { cls.contains(it, ignoreCase = true) }) return false
+        node.getBoundsInScreen(rect)
+        return rect.width() >= minSide && rect.height() >= minSide
     }
 
     /** Collects accessibility text, split into URL/query, autocomplete suggestions, and page text. */
     private fun extractScreenText(root: AccessibilityNodeInfo?): ScreenText {
+        if (root == null) return ScreenText("", "", "", mightHaveMedia = true)
         val q = StringBuilder()
         val s = StringBuilder()
         val p = StringBuilder()
-        if (root != null) collect(root, q, s, p)
-        return ScreenText(q.toString().lowercase(), s.toString().lowercase(), p.toString().lowercase())
+        val minSide = (context.resources.displayMetrics.widthPixels * MEDIA_MIN_SIDE_FRACTION).toInt()
+        val rect = Rect()
+        var foundMedia = false
+        var truncated = false
+        var visited = 0
+        // Breadth-first so the shallow toolbar/URL bar is read before deep page content hits the cap.
+        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { addLast(root) }
+        while (queue.isNotEmpty()) {
+            if (visited >= MAX_TEXT_NODES) {
+                truncated = true
+                break
+            }
+            val node = queue.removeFirst()
+            visited++
+            if (!foundMedia) foundMedia = isMediaNode(node, minSide, rect)
+            appendNodeText(node, q, s, p)
+            for (i in 0 until node.childCount) {
+                if (visited + queue.size >= MAX_TEXT_NODES) {
+                    truncated = true
+                    break
+                }
+                node.getChild(i)?.let(queue::addLast)
+            }
+        }
+        // Too few nodes (Flutter/canvas UIs) or a truncated tree: can't rule media out.
+        val mightHaveMedia = foundMedia || truncated || visited < MIN_NODES_FOR_TRUST
+        return ScreenText(q.toString().lowercase(), s.toString().lowercase(), p.toString().lowercase(), mightHaveMedia)
     }
 
     private fun extractSearchQueryFromUrl(url: String): String? {
@@ -727,7 +755,7 @@ class SmartContentDetector(private val context: Context) {
         }
     }
 
-    private fun collect(node: AccessibilityNodeInfo, q: StringBuilder, s: StringBuilder, p: StringBuilder) {
+    private fun appendNodeText(node: AccessibilityNodeInfo, q: StringBuilder, s: StringBuilder, p: StringBuilder) {
         val id = (node.viewIdResourceName ?: "").lowercase()
         val texts = listOfNotNull(node.text?.toString(), node.contentDescription?.toString())
             .filter { it.isNotBlank() }
@@ -744,9 +772,6 @@ class SmartContentDetector(private val context: Context) {
                 SUGGESTION_IDS.any { id.contains(it) } -> s.append(t).append(' ')
                 else -> p.append(t).append(' ')
             }
-        }
-        for (i in 0 until node.childCount) {
-            node.getChild(i)?.let { collect(it, q, s, p) }
         }
     }
 
