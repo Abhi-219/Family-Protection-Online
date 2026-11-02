@@ -116,8 +116,16 @@ object BankingAccessibilityPause {
             .map(String::lowercase)
             .toSet()
 
-    @Synchronized
     fun addBankingPackage(context: Context, packageName: String): Boolean {
+        val now = System.currentTimeMillis()
+        if (DnsPreferences.isActive(context) && now < DnsPreferences.getExpiryMillis(context)) return false
+        // Checked outside the object lock so the package query never blocks other callers.
+        if (isRestrictedFromPause(context, packageName.trim())) return false
+        return storeBankingPackage(context, packageName)
+    }
+
+    @Synchronized
+    private fun storeBankingPackage(context: Context, packageName: String): Boolean {
         val normalized = packageName.trim().lowercase()
         val segments = normalized.split('.')
         if (segments.size < 2 || segments.any { !packageSegmentRegex.matches(it) }) return false
@@ -211,24 +219,22 @@ object BankingAccessibilityPause {
         // CHEAP FIRST CHECK: 99.99% of events end right here in 1 nanosecond with 0 allocations!
         if (cleanPkg !in getBankingPackages(context)) return false
 
-        // Tier 1: Explicitly Blocked Adult Apps (Bumble, Tinder, etc.) — CAN NEVER BE EXEMPTED
-        if (AppListPreferences.getAllBlockedAdultApps(context).any { pattern ->
-                AppListPreferences.matchesPattern(cleanPkg, pattern)
-            }
-        ) {
-            return false
-        }
+        return !isRestrictedFromPause(context, pkgName.trim())
+    }
 
-        // Tier 2: Monitored Browsers & Social Apps (Chrome, Firefox, Opera, etc.) — CAN NEVER BE EXEMPTED
-        if (AppListPreferences.DEFAULT_BROWSER_APPS.any { cleanPkg.contains(it, ignoreCase = true) } ||
-            AppListPreferences.getAllSocialMediaApps(context).any { pattern ->
-                AppListPreferences.matchesPattern(cleanPkg, pattern)
-            }
-        ) {
-            return false
-        }
+    private val protectedSystemMarkers = listOf(
+        "settings", "packageinstaller", "permissioncontroller", "securitycenter", "systemmanager",
+        "iqoo.secure", "permissionmanager", "launcher", "systemui", "com.android.vending"
+    )
 
-        return true
+    // Priority: Blocked > Supervised > Banking. Anything blocked, supervised, monitored or system-critical can never pause accessibility.
+    fun isRestrictedFromPause(context: Context, pkgName: String): Boolean {
+        if (pkgName.equals(context.packageName, ignoreCase = true)) return true
+        if (protectedSystemMarkers.any { pkgName.contains(it, ignoreCase = true) }) return true
+        if (AppListPreferences.getAllBlockedAdultApps(context).any { AppListPreferences.matchesPattern(pkgName, it) }) return true
+        if (AppListPreferences.getAllSupervisedPatterns(context).any { AppListPreferences.matchesPattern(pkgName, it) }) return true
+        if (AppListPreferences.getAllSocialMediaApps(context).any { AppListPreferences.matchesPattern(pkgName, it) }) return true
+        return AppListPreferences.isWebBrowser(context, pkgName)
     }
 
     fun restoreIfDue(context: Context, now: Long = System.currentTimeMillis()) {
