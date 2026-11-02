@@ -137,7 +137,7 @@ private fun LogsSettings() {
         AppLogger.init(context)
         while (true) {
             logs = AppLogger.getLogs()
-            delay(750L)
+            delay(2_000L)
         }
     }
 
