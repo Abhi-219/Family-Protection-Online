@@ -48,6 +48,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.MaterialTheme
@@ -548,6 +549,7 @@ object DnsController {
 }
 
 data class DnsProvider(val name: String, val hostname: String, val description: String)
+data class DnsCategory(val categoryName: String, val categoryDescription: String, val providers: List<DnsProvider>)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -1210,16 +1212,41 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                 }
             }
 
-            // --- DNS Hostname Input & Presets ---
-            val dnsProviders = listOf(
-                DnsProvider("AdGuard (Family) | family.adguard-dns.com", DnsPreferences.DEFAULT_DNS_HOSTNAME, "Blocks ads, trackers, and adult content"),
-                DnsProvider("AdGuard (Standard) | dns.adguard.com", "dns.adguard.com", "Blocks ads and trackers"),
-                DnsProvider("Cloudflare (Family) | family.cloudflare-dns.com ", "family.cloudflare-dns.com", "Blocks malware and adult content"),
-                DnsProvider("Cloudflare (Standard) | 1dot1dot1dot1.cloudflare-dns.com", "1dot1dot1dot1.cloudflare-dns.com", "Fastest privacy-focused DNS"),
-                DnsProvider("Google Public DNS | dns.google", "dns.google", "Reliable and fast (no blocking)"),
-                DnsProvider("CleanBrowsing (Family) | family.cleanbrowsing.org", "family.cleanbrowsing.org", "Strict filter: no adult content"),
-                DnsProvider("NextDNS (Standard) | dns.nextdns.io", "dns.nextdns.io", "Highly customizable filtering"),
-                DnsProvider("Custom / Manual", "", "Type your own hostname below")
+            // --- DNS Hostname Input & Presets categorized with explanations ---
+            val dnsCategories = listOf(
+                DnsCategory(
+                    categoryName = "🔞 Adult Content Blockers (YouTube Chat ALLOWED)",
+                    categoryDescription = "Blocks adult/porn sites while keeping YouTube live chats & comments working",
+                    providers = listOf(
+                        DnsProvider("CleanBrowsing (Adult) | adult-filter.cleanbrowsing.org", "adult-filter.cleanbrowsing.org", "Blocks adult content. YouTube chats & comments stay 100% OPEN."),
+                        DnsProvider("Control D (Adult & Malware) | p2.freedns.controld.com", "p2.freedns.controld.com", "Blocks adult sites and malware. YouTube chats stay 100% OPEN.")
+                    )
+                ),
+                DnsCategory(
+                    categoryName = "🛡️ Strict Family Filters (YouTube Chat RESTRICTED)",
+                    categoryDescription = "Blocks adult content AND enforces YouTube Restricted Mode (hides chats/comments)",
+                    providers = listOf(
+                        DnsProvider("AdGuard (Family) | family.adguard-dns.com", DnsPreferences.DEFAULT_DNS_HOSTNAME, "Blocks ads, adult content & enforces YouTube SafeSearch/Restricted Mode."),
+                        DnsProvider("Cloudflare (Family) | family.cloudflare-dns.com", "family.cloudflare-dns.com", "Blocks adult sites & malware. Enforces YouTube Restricted Mode."),
+                        DnsProvider("CleanBrowsing (Family) | family.cleanbrowsing.org", "family.cleanbrowsing.org", "Strict filter: blocks adult content & enforces YouTube Restricted Mode.")
+                    )
+                ),
+                DnsCategory(
+                    categoryName = "⚡ General & Privacy DNS (Unfiltered)",
+                    categoryDescription = "No adult content blocking. Fast & private DNS.",
+                    providers = listOf(
+                        DnsProvider("Cloudflare (Standard) | 1dot1dot1dot1.cloudflare-dns.com", "1dot1dot1dot1.cloudflare-dns.com", "Fastest privacy-focused DNS (no content or chat blocking)."),
+                        DnsProvider("AdGuard (Standard) | dns.adguard.com", "dns.adguard.com", "Blocks ads and trackers only (no content or chat blocking)."),
+                        DnsProvider("Google Public DNS | dns.google", "dns.google", "Reliable & fast Google DNS (unfiltered).")
+                    )
+                ),
+                DnsCategory(
+                    categoryName = "⚙️ Custom / Manual Setup",
+                    categoryDescription = "Type any custom Private DNS hostname or NextDNS ID",
+                    providers = listOf(
+                        DnsProvider("Custom / Manual Hostname", "", "Enter your custom private DNS hostname below")
+                    )
+                )
             )
 
             ExposedDropdownMenuBox(
@@ -1231,7 +1258,7 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                     value = dnsName,
                     onValueChange = { if (!isActive) dnsName = it },
                     label = { Text("DNS Name / Hostname") },
-                    placeholder = { Text("e.g. family.cloudflare-dns.com") },
+                    placeholder = { Text("e.g. adult-filter.cleanbrowsing.org") },
                     singleLine = true,
                     enabled = !isActive,
                     trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
@@ -1245,20 +1272,43 @@ fun DnsControlScreen(isForeground: Boolean = true) {
                     expanded = expanded,
                     onDismissRequest = { expanded = false }
                 ) {
-                    dnsProviders.forEach { provider ->
+                    dnsCategories.forEach { category ->
                         DropdownMenuItem(
                             text = {
-                                Column {
-                                    Text(provider.name, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                                    Text(provider.description, fontSize = 11.sp, color = Color.Gray)
+                                Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                                    Text(
+                                        category.categoryName,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    Text(
+                                        category.categoryDescription,
+                                        fontSize = 11.sp,
+                                        color = Color.Gray
+                                    )
                                 }
                             },
-                            onClick = {
-                                dnsName = provider.hostname
-                                expanded = false
-                            },
+                            onClick = {},
+                            enabled = false,
                             contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding
                         )
+                        category.providers.forEach { provider ->
+                            DropdownMenuItem(
+                                text = {
+                                    Column(modifier = Modifier.padding(start = 12.dp)) {
+                                        Text(provider.name, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                                        Text(provider.description, fontSize = 11.sp, color = Color.DarkGray)
+                                    }
+                                },
+                                onClick = {
+                                    dnsName = provider.hostname
+                                    expanded = false
+                                },
+                                contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding
+                            )
+                        }
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
                     }
                 }
             }
